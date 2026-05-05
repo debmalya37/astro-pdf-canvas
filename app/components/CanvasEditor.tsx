@@ -1,5 +1,15 @@
 "use client";
 import React, { useState, useEffect } from 'react';
+import * as pdfjsLib from 'pdfjs-dist';
+
+// Force HTTPS, use Unpkg, and target the .mjs module for PDF.js v5+
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+
+// Helper function to convert Hex to RGB array for pixel manipulation
+const hexToRgb = (hex: string) => {
+  const bigint = parseInt(hex.replace('#', ''), 16);
+  return [(bigint >> 16) & 255, (bigint >> 8) & 255, bigint & 255];
+};
 
 interface TextElement {
   id: string;
@@ -16,128 +26,113 @@ interface TextElement {
   fontStyle?: string;
 }
 
-export default function CanvasEditor({ layoutData }: { layoutData: any }) {
-  const [elements, setElements] = useState<TextElement[]>([]);
-  // 'ALL' represents the global selection state
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+export default function CanvasEditor({ file }: { file: File }) {
+  // --- CORE STATES ---
+  const [themedPagesBase64, setThemedPagesBase64] = useState<string[]>([]);
+  const [processingProgress, setProcessingProgress] = useState<number>(0);
+  const [isProcessing, setIsProcessing] = useState<boolean>(true);
   
-  // Default to the vintage cream color
-  const [canvasBgColor, setCanvasBgColor] = useState<string>('#fdf9f1');
-  const [isExporting, setIsExporting] = useState(false);
-  
-  // State for the uploaded brand logo
+  // --- THEMING & ADMIN STATES ---
+  const [canvasBgColor, setCanvasBgColor] = useState<string>('#fdf9f1'); // Cream
   const [logoBase64, setLogoBase64] = useState<string | null>(null);
-
-  // State to hold uploaded page breakers. Key is the index where they should be inserted.
-  const [insertedPages, setInsertedPages] = useState<Record<number, string>>({});
-
-  // NEW FIX: Pagination State to prevent DOM overload lag
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
+  const [isExporting, setIsExporting] = useState(false);
 
-  // Default injection positions (Index 3 = becomes 4th page, Index 8 = becomes 9th page)
-  const defaultBreakerPositions = [
-    { index: 3, label: 'Page 4' },
-    { index: 8, label: 'Page 9' }
-  ];
+  // Zoom & Border Customization
+  const [zoom, setZoom] = useState<number>(1);
+  const [borderConfig, setBorderConfig] = useState({ color: '#b48c36', size: 3 });
 
-  // Handle logo upload and convert to Base64
-  const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setLogoBase64(reader.result as string);
-      };
-      reader.readAsDataURL(file);
-    }
-  };
+  // Advanced Text Color Mapping
+  const defaultColors = { black: '#4a3018', red: '#b48c36', green: '#2d3748' };
+  const [themeColors, setThemeColors] = useState(defaultColors);
+  const [needsReprocessing, setNeedsReprocessing] = useState(false);
 
-  // Handle Page Breaker Uploads
-  const handleInsertPageUpload = (e: React.ChangeEvent<HTMLInputElement>, insertIndex: number) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setInsertedPages(prev => ({ ...prev, [insertIndex]: reader.result as string }));
-      };
-      reader.readAsDataURL(file);
-    }
-  };
+  // --- DYNAMIC PAGE BREAKER STATES ---
+  // Store 0-based indices for insertion. Defaults are index 3 (Page 4) and index 8 (Page 9)
+  const [insertPositions, setInsertPositions] = useState<number[]>([3, 8]); 
+  const [insertedPages, setInsertedPages] = useState<Record<number, string>>({});
+  const [newPageInput, setNewPageInput] = useState<string>('');
 
-  const handleExport = async () => {
-    setIsExporting(true);
+  // Legacy Text Elements States (Kept intact)
+  const [elements, setElements] = useState<TextElement[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  // --- 1. PIXEL MANIPULATION RASTERIZATION ENGINE ---
+  const processPDF = async () => {
+    setIsProcessing(true);
+    setProcessingProgress(0);
+    setNeedsReprocessing(false);
+
     try {
-      // Send the current styled elements, background color, and logo to the backend
-      const response = await fetch('/api/export-pdf', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          elements,
-          canvasBgColor,
-          logoBase64, // Included in export
-          insertedPages, // Include the inserted pages in the export
-          pageWidth: layoutData.pages[0]?.pageInfo?.width || 595,
-          pageHeight: layoutData.pages[0]?.pageInfo?.height || 842,
-          totalPages: layoutData.pages.length
-        }),
-      });
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const totalPages = pdf.numPages;
+      const pagesArray: string[] = [];
 
-      if (!response.ok) throw new Error('Export failed');
+      const targetBlack = hexToRgb(themeColors.black);
+      const targetRed = hexToRgb(themeColors.red);
+      const targetGreen = hexToRgb(themeColors.green);
 
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'Customized_Report.pdf';
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
+      for (let i = 1; i <= totalPages; i++) {
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale: 2.0 }); 
+        
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) continue;
 
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+
+        await page.render({ canvasContext: context, viewport }).promise;
+
+        const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imageData.data;
+
+        for (let j = 0; j < data.length; j += 4) {
+          const r = data[j]; const g = data[j+1]; const b = data[j+2];
+          
+          if (r > 240 && g > 240 && b > 240) continue; 
+
+          let tr, tg, tb;
+          let isTarget = false;
+
+          if (r > g + 40 && r > b + 40) { 
+            tr = targetRed[0]; tg = targetRed[1]; tb = targetRed[2]; isTarget = true;
+          } else if (g > r + 30 && g > b + 30) { 
+            tr = targetGreen[0]; tg = targetGreen[1]; tb = targetGreen[2]; isTarget = true;
+          } else if (Math.abs(r-g) < 30 && Math.abs(g-b) < 30 && r < 200) { 
+            tr = targetBlack[0]; tg = targetBlack[1]; tb = targetBlack[2]; isTarget = true;
+          }
+
+          if (isTarget) {
+            const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            const factor = lum / 255; 
+            data[j] = Math.min(255, tr + (255 - tr) * factor);
+            data[j+1] = Math.min(255, tg + (255 - tg) * factor);
+            data[j+2] = Math.min(255, tb + (255 - tb) * factor);
+          }
+        }
+        
+        context.putImageData(imageData, 0, 0);
+        pagesArray.push(canvas.toDataURL('image/jpeg', 0.85));
+        setProcessingProgress(Math.round((i / totalPages) * 100));
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+
+      setThemedPagesBase64(pagesArray);
     } catch (error) {
-      console.error("Failed to export PDF:", error);
-      alert("Failed to export PDF. Check console.");
+      console.error("Error processing PDF:", error);
+      alert("Failed to read the PDF file. Check console for details.");
     } finally {
-      setIsExporting(false);
+      setIsProcessing(false);
     }
   };
 
   useEffect(() => {
-    if (layoutData && layoutData.pages) {
-      const allElements: TextElement[] = [];
-
-      layoutData.pages.forEach((page: any, pageIndex: number) => {
-        page.content.forEach((item: any, itemIndex: number) => {
-          
-          const text = item.str.trim();
-          
-          // NEW FIX: The Garbage Filter
-          // Ignore empty text, elements with 0 height, and the corrupted unicode replacement character or squares
-          const isGarbage = text === '' || item.height <= 0 || text.includes('\uFFFD') || text === '□';
-
-          if (!isGarbage) {
-            const isBold = item.fontName?.toLowerCase().includes('bold');
-            const isItalic = item.fontName?.toLowerCase().includes('italic');
-
-            allElements.push({
-              ...item,
-              id: `p${pageIndex}-t${itemIndex}`,
-              pageIndex: pageIndex,
-              color: '#4a3018', // Default to Dark Brown
-              fontWeight: isBold ? 'bold' : 'normal',
-              fontStyle: isItalic ? 'italic' : 'normal',
-              // Shrink font slightly to prevent overlap of adjacent words
-              fontSize: Math.round(item.height * 0.95) || 12, 
-            });
-          }
-        });
-      });
-      
-      setElements(allElements);
-      // Reset pagination when a new PDF loads
-      setCurrentPageIndex(0);
-    }
-  }, [layoutData]);
+    processPDF();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file]);
 
   const updateSelectedElement = (updates: Partial<TextElement>) => {
     if (selectedId === 'ALL') {
@@ -149,331 +144,324 @@ export default function CanvasEditor({ layoutData }: { layoutData: any }) {
     }
   };
 
-  const singleSelectedElement = elements.find(el => el.id === selectedId);
-  const activeStyles = selectedId === 'ALL' 
-    ? { color: '', fontWeight: '', fontStyle: '' } 
-    : singleSelectedElement;
-
-  // Prepare the rendering array to interleave original pages with inserted page breakers
-  const renderPages: any[] = [];
-  if (layoutData && layoutData.pages) {
-    layoutData.pages.forEach((page: any, pageIndex: number) => {
-      // If the admin uploaded a breaker for this index, insert it right BEFORE this original page renders
-      if (insertedPages[pageIndex]) {
-        renderPages.push({ type: 'inserted', imageBase64: insertedPages[pageIndex], key: `inserted-${pageIndex}` });
-      }
-      renderPages.push({ type: 'original', page, pageIndex, key: `page-${pageIndex}` });
-    });
-    // Edge case: if a breaker was added after the very last page
-    if (insertedPages[layoutData.pages.length]) {
-      renderPages.push({ type: 'inserted', imageBase64: insertedPages[layoutData.pages.length], key: `inserted-${layoutData.pages.length}` });
+  // --- 2. UPLOAD & ADMIN HANDLERS ---
+  const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const uploadedFile = e.target.files?.[0];
+    if (uploadedFile) {
+      const reader = new FileReader();
+      reader.onloadend = () => setLogoBase64(reader.result as string);
+      reader.readAsDataURL(uploadedFile);
     }
+  };
+
+  const handleInsertPageUpload = (e: React.ChangeEvent<HTMLInputElement>, insertIndex: number) => {
+    const uploadedFile = e.target.files?.[0];
+    if (uploadedFile) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setInsertedPages(prev => ({ ...prev, [insertIndex]: reader.result as string }));
+      };
+      reader.readAsDataURL(uploadedFile);
+    }
+  };
+
+  // Dynamic Position Handlers
+  const handleAddPosition = () => {
+    const pageNum = parseInt(newPageInput);
+    if (!isNaN(pageNum) && pageNum > 0) {
+      const newIndex = pageNum - 1; // Convert 1-based page to 0-based index
+      if (!insertPositions.includes(newIndex)) {
+        setInsertPositions([...insertPositions, newIndex].sort((a, b) => a - b));
+      }
+      setNewPageInput('');
+    }
+  };
+
+  const handleRemovePosition = (indexToRemove: number) => {
+    setInsertPositions(insertPositions.filter(idx => idx !== indexToRemove));
+    setInsertedPages(prev => {
+      const newPages = { ...prev };
+      delete newPages[indexToRemove];
+      return newPages;
+    });
+  };
+
+  // --- 3. EXPORT HANDLER ---
+  const handleExport = async () => {
+    setIsExporting(true);
+    try {
+      const response = await fetch('/api/export-pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          originalPagesBase64: themedPagesBase64, 
+          canvasBgColor,
+          logoBase64,
+          insertedPages,
+          borderConfig 
+        }),
+      });
+
+      if (!response.ok) throw new Error('Export failed');
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Branded_Report_${file.name.replace('.pdf', '')}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (error) {
+      console.error("Failed to export PDF:", error);
+      alert("Failed to export PDF.");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // --- 4. PREPARE RENDER ARRAY (Interleaving) ---
+  const renderPages: any[] = [];
+  themedPagesBase64.forEach((base64String, index) => {
+    if (insertedPages[index]) {
+      renderPages.push({ type: 'inserted', imageBase64: insertedPages[index], key: `inserted-${index}` });
+    }
+    renderPages.push({ type: 'original', imageBase64: base64String, pageIndex: index, key: `page-${index}` });
+  });
+  if (insertedPages[themedPagesBase64.length]) {
+    renderPages.push({ type: 'inserted', imageBase64: insertedPages[themedPagesBase64.length], key: `inserted-end` });
   }
 
-  // Determine the active page to display based on pagination
   const activePageToRender = renderPages[currentPageIndex];
 
+  // Loading Screen
+  if (isProcessing) {
+    return (
+      <div className="flex flex-col items-center justify-center h-[500px] bg-slate-50 border border-slate-200 rounded-xl shadow-sm">
+        <div className="w-12 h-12 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin mb-4"></div>
+        <h3 className="text-lg font-semibold text-slate-700">Rasterizing & Applying Theme...</h3>
+        <p className="text-slate-500 mb-4">Processing millions of pixels to preserve perfect charts.</p>
+        <div className="w-64 h-3 bg-slate-200 rounded-full overflow-hidden">
+          <div className="h-full bg-indigo-600 transition-all duration-300" style={{ width: `${processingProgress}%` }}></div>
+        </div>
+        <p className="text-sm font-bold text-indigo-600 mt-2">{processingProgress}%</p>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col h-full bg-slate-50 border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+    <div className="flex flex-col h-[85vh] bg-slate-50 border border-slate-200 rounded-xl overflow-hidden shadow-sm">
       
-      {/* PROFESSIONAL TOOLBAR */}
-      <div className="bg-white/80 backdrop-blur-md border-b border-slate-200 px-6 py-3 flex flex-wrap gap-6 items-center sticky top-0 z-50">
+      {/* PROFESSIONAL ADMIN TOOLBAR */}
+      <div className="bg-white/95 backdrop-blur-md border-b border-slate-200 px-4 py-3 flex flex-col gap-3 sticky top-0 z-50">
         
-        {/* NEW: Pagination Controls */}
-        <div className="flex items-center gap-3 pr-6 border-r border-slate-200 bg-slate-100 p-1.5 rounded-lg">
-          <button 
-            onClick={() => setCurrentPageIndex(p => Math.max(0, p - 1))}
-            disabled={currentPageIndex === 0 || renderPages.length === 0}
-            className="px-3 py-1 bg-white border border-slate-300 rounded shadow-sm text-sm font-medium disabled:opacity-50 hover:bg-slate-50 transition-colors"
-          >
-            &larr; Prev
-          </button>
-          <span className="text-sm font-semibold text-slate-700 min-w-[70px] text-center">
-            {renderPages.length > 0 ? `${currentPageIndex + 1} / ${renderPages.length}` : '0 / 0'}
-          </span>
-          <button 
-            onClick={() => setCurrentPageIndex(p => Math.min(renderPages.length - 1, p + 1))}
-            disabled={currentPageIndex === renderPages.length - 1 || renderPages.length === 0}
-            className="px-3 py-1 bg-white border border-slate-300 rounded shadow-sm text-sm font-medium disabled:opacity-50 hover:bg-slate-50 transition-colors"
-          >
-            Next &rarr;
-          </button>
-        </div>
-
-        {/* Global Document Settings */}
-        <div className="flex items-center gap-3 pr-6 border-r border-slate-200">
-          <span className="text-xs font-semibold tracking-wider text-slate-400 uppercase">Document</span>
-          <div className="flex items-center gap-2">
-            <div 
-              className="w-6 h-6 rounded-md border border-slate-300 overflow-hidden relative cursor-pointer shadow-sm hover:scale-105 transition-transform"
-              title="Canvas Background"
-            >
-              <input 
-                type="color" 
-                value={canvasBgColor} 
-                onChange={(e) => setCanvasBgColor(e.target.value)}
-                className="absolute -top-2 -left-2 w-10 h-10 cursor-pointer"
-              />
-            </div>
-          </div>
-        </div>
-
-        {/* Brand Logo Upload */}
-        <div className="flex items-center gap-3 pr-6 border-r border-slate-200">
-          <span className="text-xs font-semibold tracking-wider text-slate-400 uppercase">Branding</span>
-          <label className="cursor-pointer bg-slate-100 hover:bg-slate-200 text-slate-600 px-3 py-1.5 text-sm font-medium rounded-md transition-colors">
-            {logoBase64 ? 'Change Logo' : 'Upload Logo'}
-            <input 
-              type="file" 
-              accept="image/*" 
-              onChange={handleLogoUpload} 
-              className="hidden" 
-            />
-          </label>
-          {logoBase64 && (
-            <button 
-              onClick={() => setLogoBase64(null)}
-              className="text-xs text-red-500 hover:underline font-medium"
-            >
-              Remove
-            </button>
-          )}
-        </div>
-
-        {/* PAGE BREAKERS ADMIN TOOLS */}
-        <div className="flex items-center gap-3 pr-6 border-r border-slate-200">
-          <span className="text-xs font-semibold tracking-wider text-slate-400 uppercase">Insert Pages</span>
-          <div className="flex gap-2">
-            {defaultBreakerPositions.map((pos) => (
-              <div key={pos.index} className="flex flex-col items-center gap-1">
-                <label className={`cursor-pointer px-3 py-1.5 text-sm font-medium rounded-md transition-colors border ${insertedPages[pos.index] ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}>
-                  {insertedPages[pos.index] ? `Replace ${pos.label}` : `+ Add ${pos.label}`}
-                  <input type="file" accept="image/*" onChange={(e) => handleInsertPageUpload(e, pos.index)} className="hidden" />
-                </label>
-                {insertedPages[pos.index] && (
-                  <button onClick={() => setInsertedPages(prev => { const n = {...prev}; delete n[pos.index]; return n; })} className="text-[10px] text-red-500 hover:underline">Remove</button>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Selection Controls */}
-        <div className="flex items-center gap-2 pr-6 border-r border-slate-200">
-          <span className="text-xs font-semibold tracking-wider text-slate-400 uppercase">Selection</span>
-          <button
-            onClick={() => setSelectedId(selectedId === 'ALL' ? null : 'ALL')}
-            className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
-              selectedId === 'ALL' 
-                ? 'bg-indigo-100 text-indigo-700 hover:bg-indigo-200' 
-                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-            }`}
-          >
-            {selectedId === 'ALL' ? 'Deselect All' : 'Select All Text'}
-          </button>
-        </div>
-
-        {/* Text Formatting Tools */}
-        <div className="flex items-center gap-3">
-          <span className="text-xs font-semibold tracking-wider text-slate-400 uppercase">Typography</span>
+        {/* TOP ROW: Essential Controls */}
+        <div className="flex flex-wrap items-center gap-4 justify-between w-full">
           
-          {selectedId ? (
-            <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-lg border border-slate-200">
-              
-              {/* Color Picker */}
-              <div 
-                className="w-7 h-7 rounded bg-white border border-slate-300 overflow-hidden relative cursor-pointer hover:shadow-sm"
-                title="Text Color"
-              >
+          {/* Pagination & Zoom */}
+          <div className="flex items-center gap-3 bg-slate-100 p-1.5 rounded-lg shadow-inner">
+            <button onClick={() => setZoom(z => Math.max(0.5, z - 0.1))} className="w-7 h-7 bg-white rounded shadow-sm text-slate-600 font-bold hover:bg-slate-50">-</button>
+            <span className="text-xs font-semibold w-10 text-center">{Math.round(zoom * 100)}%</span>
+            <button onClick={() => setZoom(z => Math.min(2, z + 0.1))} className="w-7 h-7 bg-white rounded shadow-sm text-slate-600 font-bold hover:bg-slate-50">+</button>
+            <div className="w-px h-5 bg-slate-300 mx-1"></div>
+            <button onClick={() => setCurrentPageIndex(p => Math.max(0, p - 1))} disabled={currentPageIndex === 0} className="px-2 py-1 bg-white rounded shadow-sm text-xs font-bold disabled:opacity-50 hover:bg-slate-50">&larr;</button>
+            <span className="text-xs font-bold text-slate-700 min-w-[50px] text-center">{currentPageIndex + 1} / {renderPages.length}</span>
+            <button onClick={() => setCurrentPageIndex(p => Math.min(renderPages.length - 1, p + 1))} disabled={currentPageIndex === renderPages.length - 1} className="px-2 py-1 bg-white rounded shadow-sm text-xs font-bold disabled:opacity-50 hover:bg-slate-50">&rarr;</button>
+          </div>
+
+          {/* Aesthetics: Bg & Borders */}
+          <div className="flex items-center gap-4 border-l border-slate-200 pl-4">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">Bg</span>
+              <input type="color" value={canvasBgColor} onChange={(e) => setCanvasBgColor(e.target.value)} className="w-7 h-7 cursor-pointer rounded overflow-hidden shadow-sm" />
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">Border</span>
+              <input type="color" value={borderConfig.color} onChange={(e) => setBorderConfig({...borderConfig, color: e.target.value})} className="w-7 h-7 cursor-pointer rounded overflow-hidden shadow-sm" />
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">Logo</span>
+              <label className="cursor-pointer bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 text-[10px] font-bold uppercase rounded transition-colors border border-slate-200">
+                {logoBase64 ? 'Change' : 'Upload'}
+                <input type="file" accept="image/*" onChange={handleLogoUpload} className="hidden" />
+              </label>
+              {logoBase64 && <button onClick={() => setLogoBase64(null)} className="text-[10px] text-red-500 font-bold uppercase hover:underline">X</button>}
+            </div>
+          </div>
+
+          {/* Export Button */}
+          <div className="ml-auto">
+            <button 
+              onClick={handleExport}
+              disabled={isExporting || needsReprocessing}
+              className={`px-6 py-2 text-sm font-bold rounded-md shadow-md transition-all ${
+                isExporting || needsReprocessing ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-lg'
+              }`}
+            >
+              {isExporting ? 'Generating...' : 'Export as PDF'}
+            </button>
+          </div>
+        </div>
+
+        {/* BOTTOM ROW: Advanced Controls */}
+        <div className="flex flex-wrap items-end gap-6 border-t border-slate-100 pt-3">
+          
+          {/* Advanced Text Color Mapping */}
+          <div className="flex items-center gap-3">
+            <span className="text-[10px] font-bold tracking-wider text-slate-400 uppercase">Map Text Colors:</span>
+            <div className="flex items-center gap-2 bg-slate-50 p-1 rounded-lg border border-slate-200 shadow-inner">
+              <div className="flex items-center gap-1" title="Main Text">
+                <span className="text-[10px] text-slate-500 font-bold">Main</span>
+                <input type="color" value={themeColors.black} onChange={(e) => { setThemeColors({...themeColors, black: e.target.value}); setNeedsReprocessing(true); }} className="w-5 h-5 cursor-pointer rounded" />
+              </div>
+              <div className="flex items-center gap-1" title="Red Text">
+                <span className="text-[10px] text-red-500 font-bold">Red</span>
+                <input type="color" value={themeColors.red} onChange={(e) => { setThemeColors({...themeColors, red: e.target.value}); setNeedsReprocessing(true); }} className="w-5 h-5 cursor-pointer rounded" />
+              </div>
+              <div className="flex items-center gap-1" title="Green Text">
+                <span className="text-[10px] text-emerald-500 font-bold">Green</span>
+                <input type="color" value={themeColors.green} onChange={(e) => { setThemeColors({...themeColors, green: e.target.value}); setNeedsReprocessing(true); }} className="w-5 h-5 cursor-pointer rounded" />
+              </div>
+            </div>
+            {needsReprocessing && (
+              <button onClick={processPDF} className="text-[10px] bg-indigo-600 text-white font-bold px-3 py-1.5 rounded shadow-sm hover:bg-indigo-700 animate-pulse">
+                Apply Colors
+              </button>
+            )}
+            {needsReprocessing && (
+              <button onClick={() => { setThemeColors(defaultColors); setNeedsReprocessing(true); }} className="text-[10px] text-slate-500 hover:text-slate-700 underline">
+                Reset
+              </button>
+            )}
+          </div>
+
+          {/* Dynamic Page Breakers */}
+          <div className="flex items-center gap-3 border-l border-slate-200 pl-4 flex-1">
+            <span className="text-[10px] font-bold tracking-wider text-slate-400 uppercase">Insert Marketing Pages:</span>
+            <div className="flex items-center gap-2 flex-wrap">
+              {/* Dynamic Add Input */}
+              <div className="flex items-center bg-white border border-slate-200 rounded-md overflow-hidden shadow-sm">
+                <span className="text-[10px] text-slate-400 pl-2 font-bold">PAGE</span>
                 <input 
-                  type="color" 
-                  value={activeStyles?.color || '#000000'} 
-                  onChange={(e) => updateSelectedElement({ color: e.target.value })}
-                  className="absolute -top-2 -left-2 w-12 h-12 cursor-pointer"
+                  type="number" 
+                  min="1" 
+                  value={newPageInput} 
+                  onChange={(e) => setNewPageInput(e.target.value)}
+                  className="w-12 text-xs p-1 outline-none text-center font-bold text-slate-700" 
+                  placeholder="#"
                 />
+                <button onClick={handleAddPosition} className="bg-slate-100 hover:bg-indigo-50 text-indigo-600 px-2 py-1 text-xs font-bold border-l border-slate-200 transition-colors">+</button>
               </div>
 
-              <div className="w-px h-5 bg-slate-300 mx-1"></div>
-              
-              {/* Bold Toggle */}
-              <button 
-                onClick={() => {
-                  const isCurrentlyBold = selectedId === 'ALL' ? false : activeStyles?.fontWeight === 'bold';
-                  updateSelectedElement({ fontWeight: isCurrentlyBold ? 'normal' : 'bold' });
-                }}
-                className={`w-8 h-8 flex items-center justify-center rounded font-serif font-bold transition-colors ${
-                  activeStyles?.fontWeight === 'bold' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-600 hover:bg-slate-200'
-                }`}
-              >
-                B
-              </button>
-              
-              {/* Italic Toggle */}
-              <button 
-                onClick={() => {
-                  const isCurrentlyItalic = selectedId === 'ALL' ? false : activeStyles?.fontStyle === 'italic';
-                  updateSelectedElement({ fontStyle: isCurrentlyItalic ? 'normal' : 'italic' });
-                }}
-                className={`w-8 h-8 flex items-center justify-center rounded font-serif italic transition-colors ${
-                  activeStyles?.fontStyle === 'italic' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-600 hover:bg-slate-200'
-                }`}
-              >
-                I
-              </button>
+              {/* Render Available Insertion Slots */}
+              {insertPositions.map((idx) => (
+                <div key={idx} className={`flex items-center rounded-md border shadow-sm ${insertedPages[idx] ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-slate-200'}`}>
+                  <label className="cursor-pointer px-2 py-1 text-[10px] font-bold uppercase text-slate-700 transition-colors hover:bg-slate-50">
+                    {insertedPages[idx] ? `Page ${idx + 1} (Uploaded)` : `+ Page ${idx + 1}`}
+                    <input type="file" accept="image/*" onChange={(e) => handleInsertPageUpload(e, idx)} className="hidden" />
+                  </label>
+                  <button onClick={() => handleRemovePosition(idx)} className="px-2 py-1 border-l border-slate-200 hover:bg-red-50 text-red-400 font-bold text-[10px] transition-colors">
+                    X
+                  </button>
+                </div>
+              ))}
             </div>
-          ) : (
-            <span className="text-sm text-slate-400 italic">Select text or 'Select All' to edit.</span>
-          )}
-        </div>
-        
-        {/* Export Button */}
-        <div className="ml-auto pl-6 border-l border-slate-200">
-          <button 
-            onClick={handleExport}
-            disabled={isExporting}
-            className={`px-4 py-2 font-semibold rounded-md shadow-sm transition-all ${
-              isExporting 
-                ? 'bg-slate-300 text-slate-500 cursor-not-allowed' 
-                : 'bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-md'
-            }`}
-          >
-            {isExporting ? 'Generating PDF...' : 'Export as PDF'}
-          </button>
+          </div>
+
         </div>
       </div>
 
-      {/* THE CANVAS CONTAINER */}
-      <div 
-        className="flex flex-col items-center gap-10 p-10 overflow-auto h-[750px]"
-        style={{
-          backgroundImage: 'radial-gradient(#cbd5e1 1px, transparent 1px)',
-          backgroundSize: '20px 20px'
-        }}
-        onClick={() => setSelectedId(null)}
-      >
+      {/* WORKSPACE AREA (Thumbnail Sidebar + Main Canvas) */}
+      <div className="flex flex-1 overflow-hidden">
         
-        {/* Render ONLY the active page based on Pagination */}
-        {activePageToRender && (() => {
-          const item = activePageToRender;
-          const pageWidth = layoutData?.pages[0]?.pageInfo?.width || 595;
-          const pageHeight = layoutData?.pages[0]?.pageInfo?.height || 842;
+        {/* Thumbnail Sidebar */}
+        <div className="w-48 bg-slate-100 border-r border-slate-200 overflow-y-auto p-4 flex flex-col gap-4">
+          {renderPages.map((item, idx) => (
+            <div 
+              key={item.key} 
+              onClick={() => setCurrentPageIndex(idx)}
+              className={`relative cursor-pointer rounded border-2 transition-all ${currentPageIndex === idx ? 'border-indigo-600 shadow-md transform scale-105' : 'border-transparent hover:border-slate-300'}`}
+            >
+              <div className="bg-white rounded overflow-hidden aspect-[1/1.4] shadow-sm pointer-events-none relative" style={{ backgroundColor: canvasBgColor }}>
+                {item.type === 'inserted' ? (
+                  <img src={item.imageBase64} alt={`Thumb ${idx}`} className="w-full h-full object-cover" />
+                ) : (
+                  <img src={item.imageBase64} alt={`Thumb ${idx}`} className="w-full h-full object-cover" style={{ mixBlendMode: 'multiply' }} />
+                )}
+                {item.type === 'inserted' && (
+                  <div className="absolute top-1 right-1 bg-emerald-500 text-white text-[8px] font-bold px-1 rounded shadow-sm">NEW</div>
+                )}
+              </div>
+              <p className="text-center text-[10px] text-slate-500 font-bold mt-1 uppercase tracking-wide">Page {idx + 1}</p>
+            </div>
+          ))}
+        </div>
 
-          // --- RENDER INSERTED PAGE BREAKER ---
-          if (item.type === 'inserted') {
+        {/* THE MAIN CANVAS CONTAINER */}
+        <div 
+          className="flex-1 flex flex-col items-center p-10 overflow-auto"
+          style={{ backgroundImage: 'radial-gradient(#cbd5e1 1px, transparent 1px)', backgroundSize: '20px 20px' }}
+        >
+          {activePageToRender && (() => {
+            const item = activePageToRender;
+            const pageWidth = 595 * zoom;
+            const pageHeight = 842 * zoom;
+
+            // Dynamically computed CSS borders based on Admin Config
+            const outerBorder = `1px solid ${borderConfig.color}`;
+            const innerBorder = `${borderConfig.size}px solid ${borderConfig.color}`;
+            const cornerSize = 32 * zoom;
+            const cornerOffset = -borderConfig.size - 1;
+
             return (
               <div 
                 key={item.key}
-                className="relative shadow-2xl flex-shrink-0 ring-1 ring-slate-900/5 overflow-hidden flex items-center justify-center" 
+                className="relative shadow-2xl flex-shrink-0 ring-1 ring-slate-900/5 overflow-hidden flex items-center justify-center transition-all duration-200" 
                 style={{ width: `${pageWidth}px`, height: `${pageHeight}px`, backgroundColor: canvasBgColor }}
               >
-                {/* Premium Golden Borders on the inserted page to maintain branding consistency */}
-                <div className="absolute border border-[#b48c36] pointer-events-none z-0" style={{ top: '8px', bottom: '8px', left: '8px', right: '8px' }}></div>
-                <div className="absolute border-[3px] border-[#b48c36] pointer-events-none z-0" style={{ top: '16px', bottom: '16px', left: '16px', right: '16px' }}>
-                  <div className="absolute -top-4 -left-4 w-8 h-8 border-b-[3px] border-r-[3px] border-[#b48c36] rounded-br-full" style={{ backgroundColor: canvasBgColor }}></div>
-                  <div className="absolute -top-4 -right-4 w-8 h-8 border-b-[3px] border-l-[3px] border-[#b48c36] rounded-bl-full" style={{ backgroundColor: canvasBgColor }}></div>
-                  <div className="absolute -bottom-4 -left-4 w-8 h-8 border-t-[3px] border-r-[3px] border-[#b48c36] rounded-tr-full" style={{ backgroundColor: canvasBgColor }}></div>
-                  <div className="absolute -bottom-4 -right-4 w-8 h-8 border-t-[3px] border-l-[3px] border-[#b48c36] rounded-tl-full" style={{ backgroundColor: canvasBgColor }}></div>
-                </div>
-
-                {/* Uploaded Full Page Image */}
-                <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none" style={{ margin: '30px' }}>
-                  <img src={item.imageBase64} alt="Custom Page Insert" className="max-w-full max-h-full object-contain drop-shadow-md" />
-                </div>
                 
-                {/* Visual Label for Admin */}
-                <div className="absolute top-6 right-6 bg-emerald-500/90 backdrop-blur text-white text-xs px-3 py-1 rounded-full shadow-sm z-50">Custom Insert</div>
+                {item.type === 'inserted' ? (
+                  // --- INSERTED CUSTOM PAGE (FULL BLEED) ---
+                  // No margins, no borders, no logo, just full width/height image covering everything
+                  <div className="absolute inset-0 z-10">
+                    <img src={item.imageBase64} alt="Custom Insert" className="w-full h-full object-cover" />
+                    <div className="absolute top-6 right-6 bg-emerald-500/90 backdrop-blur text-white text-xs px-3 py-1 rounded-full shadow-lg z-50">Custom Marketing Page</div>
+                  </div>
+                ) : (
+                  // --- ORIGINAL THEMED PDF PAGE ---
+                  <>
+                    {/* DYNAMIC GOLDEN BORDERS */}
+                    <div className="absolute pointer-events-none z-20" style={{ top: 8*zoom, bottom: 8*zoom, left: 8*zoom, right: 8*zoom, border: outerBorder }}></div>
+                    <div className="absolute pointer-events-none z-20" style={{ top: 16*zoom, bottom: 16*zoom, left: 16*zoom, right: 16*zoom, border: innerBorder }}>
+                      <div className="absolute rounded-br-full" style={{ top: cornerOffset, left: cornerOffset, width: cornerSize, height: cornerSize, borderBottom: innerBorder, borderRight: innerBorder, backgroundColor: canvasBgColor }}></div>
+                      <div className="absolute rounded-bl-full" style={{ top: cornerOffset, right: cornerOffset, width: cornerSize, height: cornerSize, borderBottom: innerBorder, borderLeft: innerBorder, backgroundColor: canvasBgColor }}></div>
+                      <div className="absolute rounded-tr-full" style={{ bottom: cornerOffset, left: cornerOffset, width: cornerSize, height: cornerSize, borderTop: innerBorder, borderRight: innerBorder, backgroundColor: canvasBgColor }}></div>
+                      <div className="absolute rounded-tl-full" style={{ bottom: cornerOffset, right: cornerOffset, width: cornerSize, height: cornerSize, borderTop: innerBorder, borderLeft: innerBorder, backgroundColor: canvasBgColor }}></div>
+                    </div>
+
+                    {/* BRAND LOGO */}
+                    {logoBase64 && (
+                      <img src={logoBase64} alt="Brand Logo" className="absolute z-30 object-contain" style={{ top: 40*zoom, left: 40*zoom, width: 120*zoom }} />
+                    )}
+
+                    {/* CUSTOM THEMED PDF IMAGE */}
+                    <img 
+                      src={item.imageBase64} 
+                      alt={`Original Page`} 
+                      style={{ 
+                        width: '100%', 
+                        height: '100%', 
+                        objectFit: 'cover',
+                        mixBlendMode: 'multiply'
+                      }} 
+                    />
+                  </>
+                )}
               </div>
             );
-          }
-
-          // --- RENDER ORIGINAL PAGE ---
-          const { pageIndex } = item;
-
-          return (
-            <div 
-              key={item.key}
-              className="relative shadow-2xl flex-shrink-0 transition-colors duration-300 ease-in-out ring-1 ring-slate-900/5 overflow-hidden" 
-              style={{ 
-                width: `${pageWidth}px`, 
-                height: `${pageHeight}px`, 
-                backgroundColor: canvasBgColor 
-              }}
-            >
-              
-              {/* --- PREMIUM GOLDEN BORDERS --- */}
-              <div 
-                className="absolute border border-[#b48c36] pointer-events-none z-0"
-                style={{ top: '8px', bottom: '8px', left: '8px', right: '8px' }}
-              ></div>
-              <div 
-                className="absolute border-[3px] border-[#b48c36] pointer-events-none z-0"
-                style={{ top: '16px', bottom: '16px', left: '16px', right: '16px' }}
-              >
-                <div className="absolute -top-4 -left-4 w-8 h-8 border-b-[3px] border-r-[3px] border-[#b48c36] rounded-br-full" style={{ backgroundColor: canvasBgColor }}></div>
-                <div className="absolute -top-4 -right-4 w-8 h-8 border-b-[3px] border-l-[3px] border-[#b48c36] rounded-bl-full" style={{ backgroundColor: canvasBgColor }}></div>
-                <div className="absolute -bottom-4 -left-4 w-8 h-8 border-t-[3px] border-r-[3px] border-[#b48c36] rounded-tr-full" style={{ backgroundColor: canvasBgColor }}></div>
-                <div className="absolute -bottom-4 -right-4 w-8 h-8 border-t-[3px] border-l-[3px] border-[#b48c36] rounded-tl-full" style={{ backgroundColor: canvasBgColor }}></div>
-              </div>
-
-              {/* BRAND LOGO */}
-              {logoBase64 && (
-                <img 
-                  src={logoBase64} 
-                  alt="Brand Logo" 
-                  style={{
-                    position: 'absolute',
-                    top: '40px',
-                    left: '40px', 
-                    width: '120px', 
-                    zIndex: 15,
-                    objectFit: 'contain'
-                  }}
-                />
-              )}
-
-              {/* --- SCALED CONTENT WRAPPER --- */}
-              <div className="absolute inset-0 pointer-events-none" style={{ transform: 'scale(0.92)', transformOrigin: 'center center' }}>
-                <div className="relative w-full h-full pointer-events-auto">
-                  {elements.filter(el => el.pageIndex === pageIndex).map((el) => {
-                    const isSelected = selectedId === 'ALL' || selectedId === el.id;
-
-                    return (
-                      <div
-                        key={el.id}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSelectedId(el.id);
-                        }}
-                        style={{
-                          position: 'absolute',
-                          left: `${el.x}px`,
-                          top: `${el.y - (el.fontSize * 0.2)}px`, 
-                          fontSize: `${el.fontSize}px`, 
-                          color: el.color,
-                          fontWeight: el.fontWeight,
-                          fontStyle: el.fontStyle,
-                          whiteSpace: 'nowrap',
-                          letterSpacing: '-0.01em', 
-                          outline: isSelected ? '2px solid #6366f1' : 'none',
-                          outlineOffset: '2px',
-                          cursor: 'pointer',
-                          zIndex: isSelected ? 20 : 10,
-                          lineHeight: 1, 
-                          transformOrigin: 'top left',
-                          fontFamily: 'sans-serif' // Fallback font mapping
-                        }}
-                        className={`transition-all rounded-sm ${isSelected ? 'bg-indigo-500/10' : 'hover:outline hover:outline-1 hover:outline-slate-400 hover:outline-offset-2'}`}
-                      >
-                        {el.str}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-            </div>
-          );
-        })()}
+          })()}
+        </div>
       </div>
       
     </div>

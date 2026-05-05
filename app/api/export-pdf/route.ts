@@ -3,15 +3,14 @@ import puppeteer from 'puppeteer';
 
 export async function POST(req: NextRequest) {
   try {
-    // 1. Added insertedPages (defaulting to empty object just in case)
-    const { elements, canvasBgColor, logoBase64, insertedPages = {}, pageWidth, pageHeight, totalPages } = await req.json();
+    // Receive the fully processed image data from the client
+    const { originalPagesBase64, canvasBgColor, logoBase64, insertedPages } = await req.json();
 
-    // Group elements by page
-    const pagesArray = Array.from({ length: totalPages }, (_, i) => 
-      elements.filter((el: any) => el.pageIndex === i)
-    );
+    // Standard A4 dimensions mapped for Puppeteer
+    const pageWidth = 794; 
+    const pageHeight = 1123; 
 
-    // 2. Reusable border HTML so we can apply it to both text pages and inserted image pages
+    // Reusable premium golden borders
     const borderHTML = `
       <div class="border-outer"></div>
       <div class="border-inner">
@@ -22,80 +21,66 @@ export async function POST(req: NextRequest) {
       </div>
     `;
 
-    // 3. Build the dynamic body content interleaving original pages and inserted page breakers
+    // Reusable Logo injection
+    const logoHTML = logoBase64 ? `<img src="${logoBase64}" class="brand-logo" />` : '';
+
     let bodyHtml = '';
 
-    for (let i = 0; i < totalPages; i++) {
-      // A. Check if the admin inserted a page right BEFORE this index
+    // Loop through the original pages and interleave the inserted pages
+    for (let i = 0; i < originalPagesBase64.length; i++) {
+      
+      // A. Inject custom page breaker if it exists for this index
       if (insertedPages[i]) {
         bodyHtml += `
           <div class="page-container">
             ${borderHTML}
-            <div style="position: absolute; inset: 30px; z-index: 10; display: flex; align-items: center; justify-content: center;">
-              <img src="${insertedPages[i]}" style="max-width: 100%; max-height: 100%; object-fit: contain; filter: drop-shadow(0 4px 6px rgba(0,0,0,0.1));" />
+            <div class="inserted-image-wrapper">
+              <img src="${insertedPages[i]}" />
             </div>
           </div>
         `;
       }
 
-      // B. Render the original text page
-      const pageElements = pagesArray[i];
+      // B. Inject the Original Astrology Page
       bodyHtml += `
         <div class="page-container">
           ${borderHTML}
+          ${logoHTML}
+          <img 
+            src="${originalPagesBase64[i]}" 
+            class="original-pdf-page" 
+          />
+        </div>
+      `;
+    }
 
-          ${logoBase64 ? `
-            <img src="${logoBase64}" style="position: absolute; top: 40px; left: 40px; width: 120px; z-index: 15; object-fit: contain;" />
-          ` : ''}
-
-          <div class="content-wrapper">
-            ${pageElements.map((el: any) => `
-              <div class="text-element" style="
-                left: ${el.x}px; 
-                top: ${el.y - (el.fontSize * 0.2)}px; 
-                font-size: ${el.fontSize}px; 
-                color: ${el.color}; 
-                font-weight: ${el.fontWeight}; 
-                font-style: ${el.fontStyle};
-              ">
-                ${el.str}
-              </div>
-            `).join('')}
+    // C. Handle edge case: Page breaker added after the final page
+    if (insertedPages[originalPagesBase64.length]) {
+      bodyHtml += `
+        <div class="page-container">
+          ${borderHTML}
+          <div class="inserted-image-wrapper">
+            <img src="${insertedPages[originalPagesBase64.length]}" />
           </div>
         </div>
       `;
     }
 
-    // C. Handle the edge case where an admin inserts a page after the very last page
-    if (insertedPages[totalPages]) {
-      bodyHtml += `
-        <div class="page-container">
-          ${borderHTML}
-          <div style="position: absolute; inset: 30px; z-index: 10; display: flex; align-items: center; justify-content: center;">
-            <img src="${insertedPages[totalPages]}" style="max-width: 100%; max-height: 100%; object-fit: contain; filter: drop-shadow(0 4px 6px rgba(0,0,0,0.1));" />
-          </div>
-        </div>
-      `;
-    }
-
+    // Construct the full HTML document for Puppeteer to read
     const htmlContent = `
       <!DOCTYPE html>
       <html>
         <head>
-          <link rel="preconnect" href="https://fonts.googleapis.com">
-          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-          <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,100..900;1,9..144,100..900&family=Outfit:wght@100..900&display=swap" rel="stylesheet">
           <style>
             body { 
               margin: 0; 
               padding: 0; 
               background-color: ${canvasBgColor}; 
-              font-family: 'Outfit', sans-serif; 
               -webkit-print-color-adjust: exact; 
               print-color-adjust: exact;
             }
             @page {
-              size: ${pageWidth}px ${pageHeight}px;
+              size: A4;
               margin: 0;
             }
             .page-container {
@@ -104,47 +89,64 @@ export async function POST(req: NextRequest) {
               height: ${pageHeight}px;
               page-break-after: always;
               overflow: hidden;
-            }
-            .text-element {
-              position: absolute;
-              white-space: nowrap;
-              line-height: 1;
-              transform-origin: top left;
-              letter-spacing: -0.01em; 
-              z-index: 10;
+              background-color: ${canvasBgColor};
             }
             
-            /* PREMIUM GOLDEN BORDERS */
+            /* --- PDF MAGIC THEMING --- */
+            .original-pdf-page {
+              width: 100%;
+              height: 100%;
+              object-fit: cover;
+              mix-blend-mode: multiply; /* Drops the white background */
+              /* Turns black text and charts into elegant Dark Brown */
+              filter: invert(18%) sepia(35%) saturate(1478%) hue-rotate(348deg) brightness(94%) contrast(89%);
+            }
+
+            .inserted-image-wrapper {
+              position: absolute;
+              inset: 30px;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              z-index: 10;
+            }
+            .inserted-image-wrapper img {
+              max-width: 100%;
+              max-height: 100%;
+              object-fit: contain;
+            }
+
+            .brand-logo {
+              position: absolute;
+              top: 40px;
+              left: 40px;
+              width: 130px;
+              z-index: 30;
+              object-fit: contain;
+            }
+            
+            /* --- PREMIUM GOLDEN BORDERS --- */
             .border-outer {
               position: absolute;
-              top: 8px; bottom: 8px; left: 8px; right: 8px;
+              top: 10px; bottom: 10px; left: 10px; right: 10px;
               border: 1px solid #b48c36;
-              z-index: 1;
+              z-index: 20;
             }
             .border-inner {
               position: absolute;
-              top: 16px; bottom: 16px; left: 16px; right: 16px;
+              top: 20px; bottom: 20px; left: 20px; right: 20px;
               border: 3px solid #b48c36;
-              z-index: 1;
+              z-index: 20;
             }
             .corner {
               position: absolute;
-              width: 32px; height: 32px;
-              background-color: ${canvasBgColor};
+              width: 38px; height: 38px;
+              background-color: ${canvasBgColor}; /* Blends out the border lines seamlessly */
             }
-            .c-tl { top: -16px; left: -16px; border-bottom: 3px solid #b48c36; border-right: 3px solid #b48c36; border-bottom-right-radius: 100%; }
-            .c-tr { top: -16px; right: -16px; border-bottom: 3px solid #b48c36; border-left: 3px solid #b48c36; border-bottom-left-radius: 100%; }
-            .c-bl { bottom: -16px; left: -16px; border-top: 3px solid #b48c36; border-right: 3px solid #b48c36; border-top-right-radius: 100%; }
-            .c-br { bottom: -16px; right: -16px; border-top: 3px solid #b48c36; border-left: 3px solid #b48c36; border-top-left-radius: 100%; }
-            
-            /* CONTENT SCALER */
-            .content-wrapper {
-              position: absolute;
-              top: 0; left: 0; right: 0; bottom: 0;
-              width: 100%; height: 100%;
-              transform: scale(0.92);
-              transform-origin: center center;
-            }
+            .c-tl { top: -19px; left: -19px; border-bottom: 3px solid #b48c36; border-right: 3px solid #b48c36; border-bottom-right-radius: 100%; }
+            .c-tr { top: -19px; right: -19px; border-bottom: 3px solid #b48c36; border-left: 3px solid #b48c36; border-bottom-left-radius: 100%; }
+            .c-bl { bottom: -19px; left: -19px; border-top: 3px solid #b48c36; border-right: 3px solid #b48c36; border-top-right-radius: 100%; }
+            .c-br { bottom: -19px; right: -19px; border-top: 3px solid #b48c36; border-left: 3px solid #b48c36; border-top-left-radius: 100%; }
           </style>
         </head>
         <body>
@@ -153,17 +155,20 @@ export async function POST(req: NextRequest) {
       </html>
     `;
 
+    // Launch Puppeteer in headless mode
     const browser = await puppeteer.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
     });
     
     const page = await browser.newPage();
-    await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
+    
+    // Set a higher timeout for large 70+ page documents
+    await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 60000 });
 
     const pdfBuffer = await page.pdf({
       printBackground: true,
-      preferCSSPageSize: true, 
+      format: 'A4', 
     });
 
     await browser.close();
