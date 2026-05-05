@@ -2,48 +2,59 @@ import { NextRequest, NextResponse } from 'next/server';
 import puppeteer from 'puppeteer';
 
 export async function POST(req: NextRequest) {
+  let browser;
+  
   try {
-    // Receive the fully processed image data from the client
-    const { originalPagesBase64, canvasBgColor, logoBase64, insertedPages } = await req.json();
+    // 1. Extract payload, including the dynamic borderConfig
+    const { 
+      originalPagesBase64 = [], 
+      canvasBgColor = '#fdf9f1', 
+      logoBase64, 
+      insertedPages = {},
+      borderConfig = { color: '#b48c36', size: 3 }
+    } = await req.json();
 
     // Standard A4 dimensions mapped for Puppeteer
     const pageWidth = 794; 
     const pageHeight = 1123; 
 
-    // Reusable premium golden borders
+    // 2. Dynamically Generate Border HTML based on Admin Config
+    const bSize = borderConfig.size;
+    const bColor = borderConfig.color;
+    const cornerSize = 32;
+    
     const borderHTML = `
-      <div class="border-outer"></div>
-      <div class="border-inner">
-        <div class="corner c-tl"></div>
-        <div class="corner c-tr"></div>
-        <div class="corner c-bl"></div>
-        <div class="corner c-br"></div>
+      <div class="border-outer" style="border: 1px solid ${bColor};"></div>
+      <div class="border-inner" style="border: ${bSize}px solid ${bColor};">
+        <div class="corner c-tl" style="top: -${bSize + 1}px; left: -${bSize + 1}px; width: ${cornerSize}px; height: ${cornerSize}px; border-bottom: ${bSize}px solid ${bColor}; border-right: ${bSize}px solid ${bColor};"></div>
+        <div class="corner c-tr" style="top: -${bSize + 1}px; right: -${bSize + 1}px; width: ${cornerSize}px; height: ${cornerSize}px; border-bottom: ${bSize}px solid ${bColor}; border-left: ${bSize}px solid ${bColor};"></div>
+        <div class="corner c-bl" style="bottom: -${bSize + 1}px; left: -${bSize + 1}px; width: ${cornerSize}px; height: ${cornerSize}px; border-top: ${bSize}px solid ${bColor}; border-right: ${bSize}px solid ${bColor};"></div>
+        <div class="corner c-br" style="bottom: -${bSize + 1}px; right: -${bSize + 1}px; width: ${cornerSize}px; height: ${cornerSize}px; border-top: ${bSize}px solid ${bColor}; border-left: ${bSize}px solid ${bColor};"></div>
       </div>
     `;
 
     // Reusable Logo injection
-    const logoHTML = logoBase64 ? `<img src="${logoBase64}" class="brand-logo" />` : '';
+    const logoHTML = logoBase64 
+      ? `<img src="${logoBase64}" class="brand-logo" />` 
+      : '';
 
     let bodyHtml = '';
 
-    // Loop through the original pages and interleave the inserted pages
+    // 3. Loop through pages and interleave (Full-Bleed vs Themed)
     for (let i = 0; i < originalPagesBase64.length; i++) {
       
-      // A. Inject custom page breaker if it exists for this index
+      // A. Inject custom page breaker (FULL BLEED - No borders, no margins, no logos)
       if (insertedPages[i]) {
         bodyHtml += `
-          <div class="page-container">
-            ${borderHTML}
-            <div class="inserted-image-wrapper">
-              <img src="${insertedPages[i]}" />
-            </div>
+          <div class="page-container" style="background-color: ${canvasBgColor};">
+            <img src="${insertedPages[i]}" style="width: 100%; height: 100%; object-fit: cover; display: block;" />
           </div>
         `;
       }
 
-      // B. Inject the Original Astrology Page
+      // B. Inject the Original Astrology Page (Themed with borders & logo)
       bodyHtml += `
-        <div class="page-container">
+        <div class="page-container" style="background-color: ${canvasBgColor};">
           ${borderHTML}
           ${logoHTML}
           <img 
@@ -57,16 +68,13 @@ export async function POST(req: NextRequest) {
     // C. Handle edge case: Page breaker added after the final page
     if (insertedPages[originalPagesBase64.length]) {
       bodyHtml += `
-        <div class="page-container">
-          ${borderHTML}
-          <div class="inserted-image-wrapper">
-            <img src="${insertedPages[originalPagesBase64.length]}" />
-          </div>
+        <div class="page-container" style="background-color: ${canvasBgColor};">
+          <img src="${insertedPages[originalPagesBase64.length]}" style="width: 100%; height: 100%; object-fit: cover; display: block;" />
         </div>
       `;
     }
 
-    // Construct the full HTML document for Puppeteer to read
+    // 4. Construct the full HTML document
     const htmlContent = `
       <!DOCTYPE html>
       <html>
@@ -97,23 +105,9 @@ export async function POST(req: NextRequest) {
               width: 100%;
               height: 100%;
               object-fit: cover;
-              mix-blend-mode: multiply; /* Drops the white background */
-              /* Turns black text and charts into elegant Dark Brown */
-              filter: invert(18%) sepia(35%) saturate(1478%) hue-rotate(348deg) brightness(94%) contrast(89%);
-            }
-
-            .inserted-image-wrapper {
-              position: absolute;
-              inset: 30px;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              z-index: 10;
-            }
-            .inserted-image-wrapper img {
-              max-width: 100%;
-              max-height: 100%;
-              object-fit: contain;
+              display: block;
+              /* Drops the white background. (Color tinting is already done by frontend pixels) */
+              mix-blend-mode: multiply; 
             }
 
             .brand-logo {
@@ -125,28 +119,23 @@ export async function POST(req: NextRequest) {
               object-fit: contain;
             }
             
-            /* --- PREMIUM GOLDEN BORDERS --- */
+            /* --- DYNAMIC BORDER POSITIONING --- */
             .border-outer {
               position: absolute;
-              top: 10px; bottom: 10px; left: 10px; right: 10px;
-              border: 1px solid #b48c36;
+              top: 8px; bottom: 8px; left: 8px; right: 8px;
               z-index: 20;
+              pointer-events: none;
             }
             .border-inner {
               position: absolute;
-              top: 20px; bottom: 20px; left: 20px; right: 20px;
-              border: 3px solid #b48c36;
+              top: 16px; bottom: 16px; left: 16px; right: 16px;
               z-index: 20;
+              pointer-events: none;
             }
             .corner {
               position: absolute;
-              width: 38px; height: 38px;
               background-color: ${canvasBgColor}; /* Blends out the border lines seamlessly */
             }
-            .c-tl { top: -19px; left: -19px; border-bottom: 3px solid #b48c36; border-right: 3px solid #b48c36; border-bottom-right-radius: 100%; }
-            .c-tr { top: -19px; right: -19px; border-bottom: 3px solid #b48c36; border-left: 3px solid #b48c36; border-bottom-left-radius: 100%; }
-            .c-bl { bottom: -19px; left: -19px; border-top: 3px solid #b48c36; border-right: 3px solid #b48c36; border-top-right-radius: 100%; }
-            .c-br { bottom: -19px; right: -19px; border-top: 3px solid #b48c36; border-left: 3px solid #b48c36; border-top-left-radius: 100%; }
           </style>
         </head>
         <body>
@@ -155,25 +144,29 @@ export async function POST(req: NextRequest) {
       </html>
     `;
 
-    // Launch Puppeteer in headless mode
-    const browser = await puppeteer.launch({
+    // 5. Launch Puppeteer with Production Flags
+    browser = await puppeteer.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage', // Prevents memory crashes in docker/serverless environments
+        '--disable-gpu'
+      ],
     });
     
     const page = await browser.newPage();
     
-    // Set a higher timeout for large 70+ page documents
-    await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 60000 });
+    // Set a higher timeout (90 seconds) for massive 70+ page image rendering
+    await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 90000 });
 
     const pdfBuffer = await page.pdf({
       printBackground: true,
       format: 'A4', 
     });
 
-    await browser.close();
-
-    return new NextResponse(pdfBuffer, {
+    // FIX: Wrap the Uint8Array in Buffer.from() to satisfy TypeScript's BodyInit requirement
+    return new NextResponse(Buffer.from(pdfBuffer), {
       status: 200,
       headers: {
         'Content-Type': 'application/pdf',
@@ -182,10 +175,15 @@ export async function POST(req: NextRequest) {
     });
 
   } catch (error) {
-    console.error('Export Error:', error);
+    console.error('Production Export Error:', error);
     return NextResponse.json(
-      { success: false, error: 'Failed to generate PDF' }, 
+      { success: false, error: 'Failed to generate PDF due to a server error.' }, 
       { status: 500 }
     );
+  } finally {
+    // 6. GUARANTEED CLEANUP: Prevents zombie browser instances from crashing your server
+    if (browser) {
+      await browser.close().catch(e => console.error('Error closing browser:', e));
+    }
   }
 }
