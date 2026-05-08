@@ -408,7 +408,6 @@ export default function CanvasEditor({ file }: { file: File }) {
             const pageWidth = 595 * zoom;
             const pageHeight = 842 * zoom;
 
-            // Dynamically computed CSS borders based on Admin Config
             const outerBorder = `1px solid ${borderConfig.color}`;
             const innerBorder = `${borderConfig.size}px solid ${borderConfig.color}`;
             const cornerSize = 32 * zoom;
@@ -422,14 +421,14 @@ export default function CanvasEditor({ file }: { file: File }) {
               >
                 
                 {item.type === 'inserted' ? (
-                  // --- INSERTED CUSTOM PAGE (FULL BLEED) ---
-                  // No margins, no borders, no logo, just full width/height image covering everything
+                  
+                
                   <div className="absolute inset-0 z-10">
                     <img src={item.imageBase64} alt="Custom Insert" className="w-full h-full object-cover" />
                     <div className="absolute top-6 right-6 bg-emerald-500/90 backdrop-blur text-white text-xs px-3 py-1 rounded-full shadow-lg z-50">Custom Marketing Page</div>
                   </div>
                 ) : (
-                  // --- ORIGINAL THEMED PDF PAGE ---
+                  
                   <>
                     {/* DYNAMIC GOLDEN BORDERS */}
                     <div className="absolute pointer-events-none z-20" style={{ top: 8*zoom, bottom: 8*zoom, left: 8*zoom, right: 8*zoom, border: outerBorder }}></div>
