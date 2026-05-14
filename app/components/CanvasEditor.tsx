@@ -159,7 +159,8 @@ export default function CanvasEditor({ file }: { file: File }) {
         canvas.width = viewport.width;
         canvas.height = viewport.height;
 
-        await page.render({ canvasContext: context, viewport }).promise;
+        // FIX: Added 'canvas: canvas' parameter to satisfy strict PDF.js v5+ TypeScript requirements
+        await page.render({ canvasContext: context, canvas: canvas, viewport }).promise;
 
         const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
         const data = imageData.data;
@@ -266,6 +267,16 @@ export default function CanvasEditor({ file }: { file: File }) {
       } catch(e) {
         console.error("Failed to clear DB", e);
       }
+    }
+  };
+
+  const updateSelectedElement = (updates: Partial<TextElement>) => {
+    if (selectedId === 'ALL') {
+      setElements((prev) => prev.map((el) => ({ ...el, ...updates })));
+    } else {
+      setElements((prev) => 
+        prev.map((el) => (el.id === selectedId ? { ...el, ...updates } : el))
+      );
     }
   };
 
