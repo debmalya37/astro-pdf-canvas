@@ -5,6 +5,9 @@ import puppeteer from 'puppeteer';
 // Allows this route to run for up to 5 minutes (300 seconds) for massive PDFs.
 export const maxDuration = 300; 
 
+// A tiny transparent pixel used by the frontend as a fallback
+const DEFAULT_PLACEHOLDER = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
 export async function POST(req: NextRequest) {
   let browser;
   
@@ -14,7 +17,9 @@ export async function POST(req: NextRequest) {
       canvasBgColor = '#fdf9f1', 
       logoBase64, 
       insertedPages = {},
-      borderConfig = { color: '#b48c36', size: 3 }
+      borderConfig = { color: '#b48c36', size: 3 },
+      frontCovers = [], // NEW: Received from frontend
+      backCover = {}    // NEW: Received from frontend
     } = await req.json();
 
     const pageWidth = 794; 
@@ -40,11 +45,22 @@ export async function POST(req: NextRequest) {
 
     let bodyHtml = '';
 
-    // Loop through pages and interleave
+    // --- STEP 1: PREPEND FRONT COVERS ---
+    for (const coverBase64 of frontCovers) {
+      // Only render if a real image was uploaded (not the placeholder)
+      if (coverBase64 && coverBase64 !== DEFAULT_PLACEHOLDER) {
+        bodyHtml += `
+          <div class="page-container" style="background-color: ${canvasBgColor};">
+            <img src="${coverBase64}" decoding="async" style="width: 100%; height: 100%; object-fit: cover; display: block;" />
+          </div>
+        `;
+      }
+    }
+
+    // --- STEP 2: LOOP THROUGH ORIGINAL PAGES AND INTERLEAVE ---
     for (let i = 0; i < originalPagesBase64.length; i++) {
       
       // A. Inject custom page breaker (FULL BLEED)
-      // 2. FIX: Added decoding="async" to prevent main-thread freezing on huge images
       if (insertedPages[i]) {
         bodyHtml += `
           <div class="page-container" style="background-color: ${canvasBgColor};">
@@ -72,6 +88,17 @@ export async function POST(req: NextRequest) {
       bodyHtml += `
         <div class="page-container" style="background-color: ${canvasBgColor};">
           <img src="${insertedPages[originalPagesBase64.length]}" decoding="async" style="width: 100%; height: 100%; object-fit: cover; display: block;" />
+        </div>
+      `;
+    }
+
+    // --- STEP 3: APPEND BACK COVER (WITH HYPERLINK) ---
+    if (backCover && backCover.image && backCover.image !== DEFAULT_PLACEHOLDER) {
+      bodyHtml += `
+        <div class="page-container" style="background-color: ${canvasBgColor};">
+          <a href="${backCover.url || '#'}" target="_blank" style="display: block; width: 100%; height: 100%;">
+            <img src="${backCover.image}" decoding="async" style="width: 100%; height: 100%; object-fit: cover; display: block;" />
+          </a>
         </div>
       `;
     }
@@ -155,7 +182,7 @@ export async function POST(req: NextRequest) {
     
     const page = await browser.newPage();
     
-    // 3 & 4. FIX: Use 'load' instead of 'networkidle0' (since base64 requires no network) 
+    // Use 'load' instead of 'networkidle0' (since base64 requires no network) 
     // and disable Puppeteer's internal timeout (timeout: 0).
     await page.setContent(htmlContent, { waitUntil: 'load', timeout: 0 });
 

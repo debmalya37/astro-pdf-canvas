@@ -1,7 +1,19 @@
 "use client";
 import React, { useCallback, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
-import CanvasEditor from './CanvasEditor';
+import dynamic from 'next/dynamic';
+
+// FIX: Dynamically import CanvasEditor and explicitly disable Server-Side Rendering (SSR)
+// This prevents Node.js from crashing when looking for browser APIs like DOMMatrix.
+const CanvasEditor = dynamic(() => import('./CanvasEditor'), { 
+  ssr: false,
+  loading: () => (
+    <div className="flex flex-col items-center justify-center p-20 bg-white rounded-3xl border border-slate-200 shadow-sm min-h-[500px]">
+      <div className="w-10 h-10 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin mb-4"></div>
+      <p className="text-slate-500 font-bold tracking-wide animate-pulse">Initializing Cosmic Engine...</p>
+    </div>
+  )
+});
 
 export default function PdfUploader() {
   const [file, setFile] = useState<File | null>(null);
@@ -125,7 +137,7 @@ export default function PdfUploader() {
             
           </div>
 
-          {/* Pass the raw file directly to our newly architected Image-Overlay editor */}
+          {/* The Safe Client-Only Render */}
           <div className="bg-white rounded-3xl p-2 shadow-sm border border-slate-200">
             <CanvasEditor file={file} />
           </div>
