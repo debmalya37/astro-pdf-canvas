@@ -1,48 +1,10 @@
 "use client";
 import React, { useState, useEffect } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
-import { jsPDF } from 'jspdf'; // NEW: Client-side PDF generation
+import { jsPDF } from 'jspdf'; // Client-side PDF generation
 
 // Force HTTPS, use Unpkg, and target the .mjs module for PDF.js v5+
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
-
-// --- INDEXED DB STORAGE ENGINE (Bypasses 5MB localStorage limit) ---
-const DB_NAME = 'AstroPDF_Enterprise';
-const STORE_NAME = 'presets';
-
-const openDB = (): Promise<IDBDatabase> => {
-  return new Promise((resolve, reject) => {
-    if (typeof window === 'undefined' || !window.indexedDB) {
-      return reject('IndexedDB not supported');
-    }
-    const request = indexedDB.open(DB_NAME, 1);
-    request.onupgradeneeded = (e: any) => {
-      e.target.result.createObjectStore(STORE_NAME);
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-};
-
-const saveToDB = async (key: string, value: any): Promise<void> => {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).put(value, key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-};
-
-const loadFromDB = async (key: string): Promise<any> => {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    const req = tx.objectStore(STORE_NAME).get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-};
 
 // Helper function to convert Hex to RGB array for pixel manipulation
 const hexToRgb = (hex: string) => {
@@ -50,10 +12,11 @@ const hexToRgb = (hex: string) => {
   return [(bigint >> 16) & 255, (bigint >> 8) & 255, bigint & 255];
 };
 
-// Helper to load base64 string into an HTMLImageElement for canvas drawing
+// CRITICAL: crossOrigin="Anonymous" allows jsPDF to safely download Cloudinary images
 const loadImage = (src: string): Promise<HTMLImageElement> => {
   return new Promise((resolve, reject) => {
     const img = new Image();
+    img.crossOrigin = "Anonymous"; 
     img.onload = () => resolve(img);
     img.onerror = reject;
     img.src = src;
@@ -82,6 +45,7 @@ interface TextElement {
 interface Preset {
   id: string;
   name: string;
+  isGlobal?: boolean; // Flag to protect global repository presets from being overwritten
   frontCovers: string[];
   backCover: { image: string; url: string };
   insertPositions: number[];
@@ -92,6 +56,24 @@ interface Preset {
   logoBase64: string | null;
 }
 
+// --- GLOBAL / REPOSITORY PRESETS ---
+// These are hardcoded and available to all users immediately upon visiting the app.
+const GLOBAL_PRESETS: Preset[] = [
+  {
+    id: 'global-default-gold',
+    name: '🌟 Premium Gold Theme (Default)',
+    isGlobal: true,
+    frontCovers: [DEFAULT_PLACEHOLDER, DEFAULT_PLACEHOLDER, DEFAULT_PLACEHOLDER],
+    backCover: { image: DEFAULT_PLACEHOLDER, url: 'https://www.surbhigupta.com' },
+    insertPositions: [3, 8],
+    insertedPages: {},
+    themeColors: { black: '#4a3018', red: '#b48c36', green: '#2d3748' },
+    canvasBgColor: '#fdf9f1',
+    borderConfig: { color: '#b48c36', size: 3 },
+    logoBase64: null
+  }
+];
+
 export default function CanvasEditor({ file }: { file: File }) {
   // --- CORE STATES ---
   const [themedPagesBase64, setThemedPagesBase64] = useState<string[]>([]);
@@ -99,13 +81,15 @@ export default function CanvasEditor({ file }: { file: File }) {
   const [isProcessing, setIsProcessing] = useState<boolean>(true);
   
   // --- THEMING & ADMIN STATES ---
-  const [canvasBgColor, setCanvasBgColor] = useState<string>('#fdf9f1'); // Cream
+  const [canvasBgColor, setCanvasBgColor] = useState<string>('#fdf9f1'); 
   const [logoBase64, setLogoBase64] = useState<string | null>(null);
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
   
-  // Export tracking states
+  // Export & Cloud states
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [isUploadingImage, setIsUploadingImage] = useState<boolean>(false);
+  const [isSavingPreset, setIsSavingPreset] = useState<boolean>(false);
 
   // Zoom & Border Customization
   const [zoom, setZoom] = useState<number>(1);
@@ -129,24 +113,37 @@ export default function CanvasEditor({ file }: { file: File }) {
   });
 
   // --- PRESET SYSTEM STATES ---
-  const [presets, setPresets] = useState<Preset[]>([]);
+  const [presets, setPresets] = useState<Preset[]>(GLOBAL_PRESETS);
+  const [activePresetId, setActivePresetId] = useState<string | null>('global-default-gold');
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState<boolean>(false);
 
-  // Legacy Text Elements States (Kept intact)
-  const [elements, setElements] = useState<TextElement[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Helper to mark preset as dirty
+  const markDirty = () => {
+    if (!hasUnsavedChanges) setHasUnsavedChanges(true);
+  };
 
-  // --- LOAD PRESETS ON MOUNT (From IndexedDB) ---
+  // --- 1. LOAD PRESETS FROM MONGODB ON MOUNT ---
   useEffect(() => {
-    loadFromDB('astro_pdf_presets')
-      .then((savedPresets) => {
-        if (savedPresets && Array.isArray(savedPresets)) {
-          setPresets(savedPresets);
+    const fetchDBPresets = async () => {
+      try {
+        const res = await fetch('/api/presets');
+        if (res.ok) {
+          const dbPresets = await res.json();
+          if (Array.isArray(dbPresets)) {
+            // Merge global defaults with MongoDB presets
+            const dbMap = new Map(dbPresets.map((p: any) => [p.id, p]));
+            GLOBAL_PRESETS.forEach(gp => dbMap.set(gp.id, gp)); 
+            setPresets(Array.from(dbMap.values()));
+          }
         }
-      })
-      .catch((err) => console.log("No existing presets found or DB error.", err));
+      } catch (err) {
+        console.error("Failed to load presets from MongoDB.", err);
+      }
+    };
+    fetchDBPresets();
   }, []);
 
-  // --- 1. PIXEL MANIPULATION RASTERIZATION ENGINE ---
+  // --- 2. PIXEL MANIPULATION RASTERIZATION ENGINE ---
   const processPDF = async () => {
     setIsProcessing(true);
     setProcessingProgress(0);
@@ -183,7 +180,6 @@ export default function CanvasEditor({ file }: { file: File }) {
           
           if (r > 240 && g > 240 && b > 240) continue; 
 
-          // FIX: Initialize variables to satisfy strict TypeScript requirements
           let tr = 0, tg = 0, tb = 0; 
           let isTarget = false;
 
@@ -213,57 +209,143 @@ export default function CanvasEditor({ file }: { file: File }) {
       setThemedPagesBase64(pagesArray);
     } catch (error) {
       console.error("Error processing PDF:", error);
-      alert("Failed to read the PDF file. Check console for details.");
+      alert("Failed to read the PDF file.");
     } finally {
       setIsProcessing(false);
     }
   };
 
   useEffect(() => {
-    // Defer the heavy processing to the next event loop tick
-    // This allows React to paint the UI first and eliminates the cascading render warning.
-    const timer = setTimeout(() => {
-      processPDF();
-    }, 0);
-
-    // Cleanup function to prevent memory leaks if the component unmounts quickly
+    const timer = setTimeout(() => { processPDF(); }, 0);
     return () => clearTimeout(timer);
-    
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file]);
 
-  // --- PRESET SYSTEM HANDLERS (Using IndexedDB) ---
-  const handleSavePreset = async () => {
-    const name = prompt("Enter a name for this preset (e.g., 'Premium Gold Theme'):");
+  // --- CLOUDINARY UPLOAD HANDLER ---
+  const uploadToCloudinary = async (imageFile: File): Promise<string | null> => {
+    setIsUploadingImage(true);
+    const cloudName = process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME;
+    const uploadPreset = process.env.NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET;
+    
+    if (!cloudName || !uploadPreset) {
+      alert("Cloudinary credentials are not set in .env.local");
+      setIsUploadingImage(false);
+      return null;
+    }
+
+    const formData = new FormData();
+    formData.append('file', imageFile);
+    formData.append('upload_preset', uploadPreset);
+
+    try {
+      const res = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await res.json();
+      return data.secure_url; // Return the secure Cloudinary URL
+    } catch (err) {
+      console.error("Cloudinary upload failed", err);
+      alert("Failed to upload image to the cloud.");
+      return null;
+    } finally {
+      setIsUploadingImage(false);
+    }
+  };
+
+  // --- MONGODB PRESET SYSTEM HANDLERS ---
+  const handleSaveAsNew = async () => {
+    const name = prompt("Enter a name for this new preset (e.g., 'Winter Campaign'):");
     if (!name) return;
 
     const newPreset: Preset = {
       id: Date.now().toString(),
       name,
-      frontCovers,
-      backCover,
-      insertPositions,
-      insertedPages,
-      themeColors,
-      canvasBgColor,
-      borderConfig,
-      logoBase64
+      frontCovers, backCover, insertPositions, insertedPages, themeColors, canvasBgColor, borderConfig, logoBase64
     };
 
+    setIsSavingPreset(true);
     try {
-      const updatedPresets = [...presets, newPreset];
-      await saveToDB('astro_pdf_presets', updatedPresets);
-      setPresets(updatedPresets);
-      alert('Preset saved successfully! High-resolution images are safely stored in your browser database.');
+      const res = await fetch('/api/presets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newPreset)
+      });
+      if (!res.ok) throw new Error("Failed to save to DB");
+
+      setPresets([...presets, newPreset]);
+      setActivePresetId(newPreset.id);
+      setHasUnsavedChanges(false);
     } catch (e) {
-      console.error("IndexedDB Storage error:", e);
-      alert("Failed to save preset to the local database.");
+      console.error("MongoDB Storage error:", e);
+      alert("Failed to save preset to database.");
+    } finally {
+      setIsSavingPreset(false);
+    }
+  };
+
+  const handleUpdatePreset = async () => {
+    if (!activePresetId) return;
+    const presetToUpdate = presets.find(p => p.id === activePresetId);
+    
+    // Safety check: Cannot overwrite global presets
+    if (!presetToUpdate || presetToUpdate.isGlobal) return;
+
+    const updatedPreset: Preset = {
+      ...presetToUpdate,
+      frontCovers, backCover, insertPositions, insertedPages, themeColors, canvasBgColor, borderConfig, logoBase64
+    };
+
+    setIsSavingPreset(true);
+    try {
+      const res = await fetch('/api/presets', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedPreset)
+      });
+      if (!res.ok) throw new Error("Failed to update DB");
+
+      setPresets(presets.map(p => p.id === activePresetId ? updatedPreset : p));
+      setHasUnsavedChanges(false);
+    } catch (e) {
+      console.error("MongoDB Storage error:", e);
+      alert("Failed to update preset in database.");
+    } finally {
+      setIsSavingPreset(false);
+    }
+  };
+
+  const handleDiscard = () => {
+    if (!activePresetId) return;
+    const p = presets.find(p => p.id === activePresetId);
+    if (p) {
+      setFrontCovers(p.frontCovers);
+      setBackCover(p.backCover);
+      setInsertPositions(p.insertPositions);
+      setInsertedPages(p.insertedPages);
+      setThemeColors(p.themeColors);
+      setCanvasBgColor(p.canvasBgColor);
+      setBorderConfig(p.borderConfig);
+      setLogoBase64(p.logoBase64);
+      
+      setHasUnsavedChanges(false);
+      setNeedsReprocessing(true);
     }
   };
 
   const handleLoadPreset = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const presetId = e.target.value;
-    if (!presetId) return;
+    
+    if (!presetId) {
+      setActivePresetId(null);
+      setHasUnsavedChanges(false);
+      return;
+    }
+
+    if (hasUnsavedChanges) {
+      const confirmLeave = confirm("You have unsaved changes. Are you sure you want to load a different preset and discard them?");
+      if (!confirmLeave) return;
+    }
 
     const p = presets.find(p => p.id === presetId);
     if (p) {
@@ -276,74 +358,70 @@ export default function CanvasEditor({ file }: { file: File }) {
       setBorderConfig(p.borderConfig);
       setLogoBase64(p.logoBase64);
       
-      // Force user to apply the new text colors to the current PDF
+      setActivePresetId(presetId);
+      setHasUnsavedChanges(false);
       setNeedsReprocessing(true); 
     }
   };
 
   const handleClearPresets = async () => {
-    if (confirm("Are you sure you want to delete all saved presets?")) {
+    if (confirm("Are you sure you want to delete all Database presets? (Global defaults will remain)")) {
       try {
-        await saveToDB('astro_pdf_presets', []);
-        setPresets([]);
+        await fetch('/api/presets', { method: 'DELETE' });
+        setPresets([...GLOBAL_PRESETS]);
+        
+        // If the active preset was just deleted, reset to default
+        if (activePresetId && !GLOBAL_PRESETS.find(p => p.id === activePresetId)) {
+          setActivePresetId('global-default-gold');
+          handleDiscard(); 
+        }
       } catch(e) {
         console.error("Failed to clear DB", e);
       }
     }
   };
 
-  const updateSelectedElement = (updates: Partial<TextElement>) => {
-    if (selectedId === 'ALL') {
-      setElements((prev) => prev.map((el) => ({ ...el, ...updates })));
-    } else {
-      setElements((prev) => 
-        prev.map((el) => (el.id === selectedId ? { ...el, ...updates } : el))
-      );
+  // --- UPLOAD & ADMIN HANDLERS (Cloudinary integrated) ---
+  const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const url = await uploadToCloudinary(file);
+      if (url) { setLogoBase64(url); markDirty(); }
     }
   };
 
-  // --- 2. UPLOAD & ADMIN HANDLERS ---
-  const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const uploadedFile = e.target.files?.[0];
-    if (uploadedFile) {
-      const reader = new FileReader();
-      reader.onloadend = () => setLogoBase64(reader.result as string);
-      reader.readAsDataURL(uploadedFile);
+  const handleInsertPageUpload = async (e: React.ChangeEvent<HTMLInputElement>, insertIndex: number) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const url = await uploadToCloudinary(file);
+      if (url) {
+        setInsertedPages(prev => ({ ...prev, [insertIndex]: url }));
+        markDirty();
+      }
     }
   };
 
-  const handleInsertPageUpload = (e: React.ChangeEvent<HTMLInputElement>, insertIndex: number) => {
-    const uploadedFile = e.target.files?.[0];
-    if (uploadedFile) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setInsertedPages(prev => ({ ...prev, [insertIndex]: reader.result as string }));
-      };
-      reader.readAsDataURL(uploadedFile);
-    }
-  };
-
-  const handleFrontCoverUpload = (e: React.ChangeEvent<HTMLInputElement>, index: number) => {
-    const uploadedFile = e.target.files?.[0];
-    if (uploadedFile) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
+  const handleFrontCoverUpload = async (e: React.ChangeEvent<HTMLInputElement>, index: number) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const url = await uploadToCloudinary(file);
+      if (url) {
         const newCovers = [...frontCovers];
-        newCovers[index] = reader.result as string;
+        newCovers[index] = url;
         setFrontCovers(newCovers);
-      };
-      reader.readAsDataURL(uploadedFile);
+        markDirty();
+      }
     }
   };
 
-  const handleBackCoverUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const uploadedFile = e.target.files?.[0];
-    if (uploadedFile) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setBackCover(prev => ({ ...prev, image: reader.result as string }));
-      };
-      reader.readAsDataURL(uploadedFile);
+  const handleBackCoverUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const url = await uploadToCloudinary(file);
+      if (url) {
+        setBackCover(prev => ({ ...prev, image: url }));
+        markDirty();
+      }
     }
   };
 
@@ -353,6 +431,7 @@ export default function CanvasEditor({ file }: { file: File }) {
       const newIndex = pageNum - 1; 
       if (!insertPositions.includes(newIndex)) {
         setInsertPositions([...insertPositions, newIndex].sort((a, b) => a - b));
+        markDirty();
       }
       setNewPageInput('');
     }
@@ -365,9 +444,10 @@ export default function CanvasEditor({ file }: { file: File }) {
       delete newPages[indexToRemove];
       return newPages;
     });
+    markDirty();
   };
 
-  // --- 4. PREPARE RENDER ARRAY (Interleaving) ---
+  // --- PREPARE RENDER ARRAY (Interleaving) ---
   const renderPages: any[] = [];
   
   frontCovers.forEach((base64, index) => {
@@ -393,7 +473,6 @@ export default function CanvasEditor({ file }: { file: File }) {
 
 
   // --- 3. EXPORT HANDLER (Client-Side jsPDF Engine) ---
-  // Completely bypasses Vercel's 4.5MB Payload limit by rendering directly in the browser!
   const handleExport = async () => {
     setIsExporting(true);
     setExportProgress(0);
@@ -408,48 +487,37 @@ export default function CanvasEditor({ file }: { file: File }) {
       for (let i = 0; i < renderPages.length; i++) {
         const item = renderPages[i];
         
-        // 1. Create an offscreen canvas to paint the page
         const canvas = document.createElement('canvas');
         canvas.width = pdfWidth * scale;
         canvas.height = pdfHeight * scale;
         const ctx = canvas.getContext('2d');
         if (!ctx) continue;
 
-        // 2. Fill Background Color
         ctx.fillStyle = canvasBgColor;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
         if (item.type === 'original') {
-          // A. DRAW GOLDEN BORDERS natively in Canvas
           const bSize = borderConfig.size * scale;
           const offset = 16 * scale;
           const cSize = 32 * scale;
           
           ctx.strokeStyle = borderConfig.color;
-          
-          // Outer Border
           ctx.lineWidth = 1 * scale;
           ctx.strokeRect(8 * scale, 8 * scale, canvas.width - 16 * scale, canvas.height - 16 * scale);
           
-          // Inner Border & Corners Masking
           ctx.lineWidth = bSize;
           ctx.strokeRect(offset, offset, canvas.width - offset*2, canvas.height - offset*2);
           
           ctx.fillStyle = canvasBgColor;
-          // Top Left Corner
           ctx.fillRect(offset - bSize, offset - bSize, cSize, cSize);
           ctx.beginPath(); ctx.arc(offset - bSize, offset - bSize, cSize, 0, Math.PI/2); ctx.stroke();
-          // Top Right Corner
           ctx.fillRect(canvas.width - offset + bSize - cSize, offset - bSize, cSize, cSize);
           ctx.beginPath(); ctx.arc(canvas.width - offset + bSize, offset - bSize, cSize, Math.PI/2, Math.PI); ctx.stroke();
-          // Bottom Right Corner
           ctx.fillRect(canvas.width - offset + bSize - cSize, canvas.height - offset + bSize - cSize, cSize, cSize);
           ctx.beginPath(); ctx.arc(canvas.width - offset + bSize, canvas.height - offset + bSize, cSize, Math.PI, Math.PI*1.5); ctx.stroke();
-          // Bottom Left Corner
           ctx.fillRect(offset - bSize, canvas.height - offset + bSize - cSize, cSize, cSize);
           ctx.beginPath(); ctx.arc(offset - bSize, canvas.height - offset + bSize, cSize, Math.PI*1.5, Math.PI*2); ctx.stroke();
 
-          // B. DRAW LOGO
           if (logoBase64) {
             const logoImg = await loadImage(logoBase64);
             const lWidth = 120 * scale;
@@ -457,36 +525,30 @@ export default function CanvasEditor({ file }: { file: File }) {
             ctx.drawImage(logoImg, 40 * scale, 40 * scale, lWidth, lHeight);
           }
 
-          // C. DRAW THEMED PDF PAGE (Using mix-blend-mode: multiply natively)
           const pdfImg = await loadImage(item.imageBase64);
           ctx.globalCompositeOperation = 'multiply';
           ctx.drawImage(pdfImg, 0, 0, canvas.width, canvas.height);
-          ctx.globalCompositeOperation = 'source-over'; // Reset
+          ctx.globalCompositeOperation = 'source-over'; 
 
         } else {
-          // --- FULL BLEED PAGES (Inserted, Front Cover, Back Cover) ---
           if (item.imageBase64 && item.imageBase64 !== DEFAULT_PLACEHOLDER) {
             const img = await loadImage(item.imageBase64);
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           }
         }
 
-        // 3. Compress painted canvas to JPEG and add to PDF
         const finalImgData = canvas.toDataURL('image/jpeg', 0.85);
         if (i > 0) pdf.addPage();
         pdf.addImage(finalImgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
 
-        // 4. Attach Hyperlink for Back Cover
         if (item.type === 'back-cover' && item.url) {
           pdf.link(0, 0, pdfWidth, pdfHeight, { url: item.url });
         }
 
-        // Update Progress
         setExportProgress(Math.round(((i + 1) / renderPages.length) * 100));
-        await new Promise(resolve => setTimeout(resolve, 0)); // Yield to UI thread
+        await new Promise(resolve => setTimeout(resolve, 0)); 
       }
 
-      // 5. Trigger native browser download!
       pdf.save(`Branded_Report_${file.name.replace('.pdf', '')}.pdf`);
 
     } catch (error) {
@@ -498,6 +560,7 @@ export default function CanvasEditor({ file }: { file: File }) {
   };
 
   const activePageToRender = renderPages[currentPageIndex];
+  const activePreset = presets.find(p => p.id === activePresetId);
 
   // Loading Screen
   if (isProcessing) {
@@ -515,30 +578,72 @@ export default function CanvasEditor({ file }: { file: File }) {
   }
 
   return (
-    <div className="flex flex-col h-[85vh] bg-slate-50 border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+    <div className="flex flex-col h-[85vh] bg-slate-50 border border-slate-200 rounded-xl overflow-hidden shadow-sm relative">
       
+      {/* CLOUD UPLOADING OVERLAY */}
+      {isUploadingImage && (
+        <div className="absolute inset-0 z-[60] bg-slate-900/20 backdrop-blur-sm flex flex-col items-center justify-center rounded-xl">
+           <div className="w-12 h-12 border-4 border-white/30 border-t-white rounded-full animate-spin mb-3 shadow-md"></div>
+           <p className="text-indigo-700 font-bold text-sm bg-white px-5 py-2.5 rounded-full shadow-lg flex items-center gap-2">
+             <svg className="w-4 h-4 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
+             Uploading to Cloudinary...
+           </p>
+        </div>
+      )}
+
       {/* PROFESSIONAL ADMIN TOOLBAR */}
-      <div className="bg-white/95 backdrop-blur-md border-b border-slate-200 px-4 py-3 flex flex-col gap-3 sticky top-0 z-50 overflow-y-auto max-h-[40vh]">
+      <div className="bg-white/95 backdrop-blur-md border-b border-slate-200 px-4 py-3 flex flex-col gap-3 sticky top-0 z-50 overflow-y-auto max-h-[45vh]">
         
-        {/* ROW 0: PRESETS SYSTEM */}
-        <div className="flex items-center gap-4 bg-indigo-50/50 p-2 rounded-lg border border-indigo-100">
+        {/* ROW 0: DB PRESETS SYSTEM WORKSPACE */}
+        <div className="flex flex-wrap items-center gap-4 bg-indigo-50/50 p-2.5 rounded-lg border border-indigo-100 shadow-sm">
           <span className="text-xs font-bold tracking-wider text-indigo-800 uppercase flex items-center gap-1">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" /></svg>
-            Presets:
+            Cloud Presets:
           </span>
           <select 
+            value={activePresetId || ''}
             onChange={handleLoadPreset} 
-            className="text-xs p-1.5 border border-indigo-200 rounded w-56 font-bold text-indigo-900 outline-none bg-white cursor-pointer shadow-sm"
+            className="text-xs p-1.5 border border-indigo-200 rounded w-64 font-bold text-indigo-900 outline-none bg-white cursor-pointer shadow-sm"
           >
-            <option value="">-- Load an existing preset --</option>
-            {presets.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            <option value="">-- Custom / Unsaved --</option>
+            {presets.map(p => (
+              <option key={p.id} value={p.id}>
+                {p.isGlobal ? '🌍 ' : '☁️ '}{p.name}
+              </option>
+            ))}
           </select>
-          <button onClick={handleSavePreset} className="px-4 py-1.5 bg-indigo-600 text-white text-xs font-bold rounded shadow-sm hover:bg-indigo-700 transition-colors">
-            + Save Current Settings as Preset
-          </button>
-          {presets.length > 0 && (
+
+          <div className="flex items-center gap-2">
+            {activePresetId ? (
+              <>
+                {!activePreset?.isGlobal && (
+                  <button 
+                    onClick={handleUpdatePreset} 
+                    disabled={!hasUnsavedChanges || isSavingPreset}
+                    className={`px-3 py-1.5 text-xs font-bold rounded shadow-sm transition-all ${hasUnsavedChanges ? 'bg-amber-500 text-white hover:bg-amber-600 animate-pulse' : 'bg-slate-200 text-slate-500 cursor-not-allowed'}`}
+                  >
+                    {isSavingPreset ? 'Saving...' : hasUnsavedChanges ? '⚠️ Save Changes' : '✓ Saved to DB'}
+                  </button>
+                )}
+                <button onClick={handleSaveAsNew} disabled={isSavingPreset} className="px-3 py-1.5 bg-indigo-600 text-white text-xs font-bold rounded shadow-sm hover:bg-indigo-700 transition-colors">
+                  + Save as New
+                </button>
+                {hasUnsavedChanges && (
+                  <button onClick={handleDiscard} className="px-3 py-1.5 bg-slate-200 text-slate-600 text-xs font-bold rounded hover:bg-slate-300 transition-colors">
+                    Discard
+                  </button>
+                )}
+              </>
+            ) : (
+              <button onClick={handleSaveAsNew} disabled={isSavingPreset} className="px-4 py-1.5 bg-indigo-600 text-white text-xs font-bold rounded shadow-sm hover:bg-indigo-700 transition-colors">
+                + Save as New Preset
+              </button>
+            )}
+          </div>
+
+          {presets.filter(p => !p.isGlobal).length > 0 && (
             <button onClick={handleClearPresets} className="ml-auto px-3 py-1.5 text-red-500 hover:bg-red-50 text-xs font-bold rounded transition-colors">
-              Clear All Presets
+              Clear DB Presets
             </button>
           )}
         </div>
@@ -546,7 +651,6 @@ export default function CanvasEditor({ file }: { file: File }) {
         {/* ROW 1: Essential Controls */}
         <div className="flex flex-wrap items-center gap-4 justify-between w-full">
           
-          {/* Pagination & Zoom */}
           <div className="flex items-center gap-3 bg-slate-100 p-1.5 rounded-lg shadow-inner">
             <button onClick={() => setZoom(z => Math.max(0.5, z - 0.1))} className="w-7 h-7 bg-white rounded shadow-sm text-slate-600 font-bold hover:bg-slate-50">-</button>
             <span className="text-xs font-semibold w-10 text-center">{Math.round(zoom * 100)}%</span>
@@ -557,15 +661,14 @@ export default function CanvasEditor({ file }: { file: File }) {
             <button onClick={() => setCurrentPageIndex(p => Math.min(renderPages.length - 1, p + 1))} disabled={currentPageIndex === renderPages.length - 1} className="px-2 py-1 bg-white rounded shadow-sm text-xs font-bold disabled:opacity-50 hover:bg-slate-50">&rarr;</button>
           </div>
 
-          {/* Aesthetics: Bg & Borders */}
           <div className="flex items-center gap-4 border-l border-slate-200 pl-4">
             <div className="flex items-center gap-2">
               <span className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">Bg</span>
-              <input type="color" value={canvasBgColor} onChange={(e) => setCanvasBgColor(e.target.value)} className="w-7 h-7 cursor-pointer rounded overflow-hidden shadow-sm" />
+              <input type="color" value={canvasBgColor} onChange={(e) => { setCanvasBgColor(e.target.value); markDirty(); }} className="w-7 h-7 cursor-pointer rounded overflow-hidden shadow-sm" />
             </div>
             <div className="flex items-center gap-2">
               <span className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">Border</span>
-              <input type="color" value={borderConfig.color} onChange={(e) => setBorderConfig({...borderConfig, color: e.target.value})} className="w-7 h-7 cursor-pointer rounded overflow-hidden shadow-sm" />
+              <input type="color" value={borderConfig.color} onChange={(e) => { setBorderConfig({...borderConfig, color: e.target.value}); markDirty(); }} className="w-7 h-7 cursor-pointer rounded overflow-hidden shadow-sm" />
             </div>
             <div className="flex items-center gap-2">
               <span className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">Logo</span>
@@ -573,17 +676,16 @@ export default function CanvasEditor({ file }: { file: File }) {
                 {logoBase64 ? 'Change' : 'Upload'}
                 <input type="file" accept="image/*" onChange={handleLogoUpload} className="hidden" />
               </label>
-              {logoBase64 && <button onClick={() => setLogoBase64(null)} className="text-[10px] text-red-500 font-bold uppercase hover:underline">X</button>}
+              {logoBase64 && <button onClick={() => { setLogoBase64(null); markDirty(); }} className="text-[10px] text-red-500 font-bold uppercase hover:underline">X</button>}
             </div>
           </div>
 
-          {/* Export Button */}
           <div className="ml-auto">
             <button 
               onClick={handleExport}
-              disabled={isExporting || needsReprocessing}
+              disabled={isExporting || needsReprocessing || isUploadingImage}
               className={`px-6 py-2 text-sm font-bold rounded-md shadow-md transition-all ${
-                isExporting || needsReprocessing ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700 hover:shadow-lg'
+                isExporting || needsReprocessing || isUploadingImage ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700 hover:shadow-lg'
               }`}
             >
               {isExporting ? `Compiling PDF (${exportProgress}%)...` : 'Export as PDF'}
@@ -599,19 +701,18 @@ export default function CanvasEditor({ file }: { file: File }) {
             <div className="flex items-center gap-2 bg-slate-50 p-1 rounded-lg border border-slate-200 shadow-inner">
               <div className="flex items-center gap-1" title="Main Text">
                 <span className="text-[10px] text-slate-500 font-bold">Main</span>
-                <input type="color" value={themeColors.black} onChange={(e) => { setThemeColors({...themeColors, black: e.target.value}); setNeedsReprocessing(true); }} className="w-5 h-5 cursor-pointer rounded" />
+                <input type="color" value={themeColors.black} onChange={(e) => { setThemeColors({...themeColors, black: e.target.value}); setNeedsReprocessing(true); markDirty(); }} className="w-5 h-5 cursor-pointer rounded" />
               </div>
               <div className="flex items-center gap-1" title="Red Text">
                 <span className="text-[10px] text-red-500 font-bold">Red</span>
-                <input type="color" value={themeColors.red} onChange={(e) => { setThemeColors({...themeColors, red: e.target.value}); setNeedsReprocessing(true); }} className="w-5 h-5 cursor-pointer rounded" />
+                <input type="color" value={themeColors.red} onChange={(e) => { setThemeColors({...themeColors, red: e.target.value}); setNeedsReprocessing(true); markDirty(); }} className="w-5 h-5 cursor-pointer rounded" />
               </div>
               <div className="flex items-center gap-1" title="Green Text">
                 <span className="text-[10px] text-emerald-500 font-bold">Green</span>
-                <input type="color" value={themeColors.green} onChange={(e) => { setThemeColors({...themeColors, green: e.target.value}); setNeedsReprocessing(true); }} className="w-5 h-5 cursor-pointer rounded" />
+                <input type="color" value={themeColors.green} onChange={(e) => { setThemeColors({...themeColors, green: e.target.value}); setNeedsReprocessing(true); markDirty(); }} className="w-5 h-5 cursor-pointer rounded" />
               </div>
             </div>
-            {needsReprocessing && <button onClick={processPDF} className="text-[10px] bg-indigo-600 text-white font-bold px-3 py-1.5 rounded shadow-sm hover:bg-indigo-700 animate-pulse">Apply Preset Colors</button>}
-            {needsReprocessing && <button onClick={() => { setThemeColors(defaultColors); setNeedsReprocessing(true); }} className="text-[10px] text-slate-500 hover:text-slate-700 underline">Reset</button>}
+            {needsReprocessing && <button onClick={processPDF} className="text-[10px] bg-indigo-600 text-white font-bold px-3 py-1.5 rounded shadow-sm hover:bg-indigo-700 animate-pulse">Apply Colors</button>}
           </div>
 
           <div className="flex items-center gap-3 border-l border-slate-200 pl-4 flex-1">
@@ -656,24 +757,23 @@ export default function CanvasEditor({ file }: { file: File }) {
             <input 
               type="text" 
               value={backCover.url} 
-              onChange={(e) => setBackCover({ ...backCover, url: e.target.value })} 
+              onChange={(e) => { setBackCover({ ...backCover, url: e.target.value }); markDirty(); }} 
               className="text-xs p-1.5 border border-slate-200 rounded w-48 font-medium text-slate-600 outline-none focus:border-indigo-400"
               placeholder="https://your-website.com"
-              title="Hyperlink for Back Cover"
             />
           </div>
         </div>
 
       </div>
 
-      {/* WORKSPACE AREA (Thumbnail Sidebar + Main Canvas) */}
+      {/* WORKSPACE AREA */}
       <div className="flex flex-1 overflow-hidden">
         
         {/* Thumbnail Sidebar */}
         <div className="w-48 bg-slate-100 border-r border-slate-200 overflow-y-auto p-4 flex flex-col gap-4">
           {renderPages.map((item, idx) => (
             <div 
-              key={item.key} 
+              key={item.key || idx} 
               onClick={() => setCurrentPageIndex(idx)}
               className={`relative cursor-pointer rounded border-2 transition-all ${currentPageIndex === idx ? 'border-indigo-600 shadow-md transform scale-105' : 'border-transparent hover:border-slate-300'}`}
             >
@@ -686,7 +786,6 @@ export default function CanvasEditor({ file }: { file: File }) {
                   <img src={item.imageBase64} alt={`Thumb ${idx}`} className="w-full h-full object-cover" />
                 )}
                 
-                {/* Labels for Thumbnails */}
                 {item.type === 'front-cover' && <div className="absolute top-1 right-1 bg-indigo-500 text-white text-[7px] font-bold px-1 rounded shadow-sm">FRONT</div>}
                 {item.type === 'inserted' && <div className="absolute top-1 right-1 bg-emerald-500 text-white text-[7px] font-bold px-1 rounded shadow-sm">NEW</div>}
                 {item.type === 'back-cover' && <div className="absolute top-1 right-1 bg-violet-500 text-white text-[7px] font-bold px-1 rounded shadow-sm">BACK+LINK</div>}
@@ -696,7 +795,7 @@ export default function CanvasEditor({ file }: { file: File }) {
           ))}
         </div>
 
-        {/* THE MAIN CANVAS CONTAINER */}
+        {/* MAIN CANVAS CONTAINER */}
         <div 
           className="flex-1 flex flex-col items-center p-10 overflow-auto"
           style={{ backgroundImage: 'radial-gradient(#cbd5e1 1px, transparent 1px)', backgroundSize: '20px 20px' }}
@@ -713,21 +812,19 @@ export default function CanvasEditor({ file }: { file: File }) {
 
             return (
               <div 
-                key={item.key}
+                key={item.key || 'main'}
                 className="relative shadow-2xl flex-shrink-0 ring-1 ring-slate-900/5 overflow-hidden flex items-center justify-center transition-all duration-200" 
                 style={{ width: `${pageWidth}px`, height: `${pageHeight}px`, backgroundColor: canvasBgColor }}
               >
                 
                 {(item.type === 'inserted' || item.type === 'front-cover' || item.type === 'back-cover') ? (
                   
-                  // --- FULL BLEED PAGES (Front/Back/Inserted) ---
                   <div className="absolute inset-0 z-10 flex flex-col items-center justify-center">
                     {item.imageBase64 === DEFAULT_PLACEHOLDER ? (
                        <p className="text-sm font-bold text-slate-400 uppercase tracking-widest border-2 border-dashed border-slate-300 p-10 rounded-xl">
                          Upload Image in Toolbar
                        </p>
                     ) : item.type === 'back-cover' ? (
-                       // Visual Preview of the Clickable Back Cover
                        <a href={item.url} target="_blank" rel="noreferrer" className="w-full h-full relative cursor-pointer block group">
                          <img src={item.imageBase64} alt="Back Cover" className="w-full h-full object-cover" />
                          <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors flex items-center justify-center">
@@ -745,10 +842,7 @@ export default function CanvasEditor({ file }: { file: File }) {
                   </div>
                   
                 ) : (
-                  
-                  // --- ORIGINAL THEMED PDF PAGE ---
                   <>
-                    {/* DYNAMIC GOLDEN BORDERS */}
                     <div className="absolute pointer-events-none z-20" style={{ top: 8*zoom, bottom: 8*zoom, left: 8*zoom, right: 8*zoom, border: outerBorder }}></div>
                     <div className="absolute pointer-events-none z-20" style={{ top: 16*zoom, bottom: 16*zoom, left: 16*zoom, right: 16*zoom, border: innerBorder }}>
                       <div className="absolute rounded-br-full" style={{ top: cornerOffset, left: cornerOffset, width: cornerSize, height: cornerSize, borderBottom: innerBorder, borderRight: innerBorder, backgroundColor: canvasBgColor }}></div>
@@ -757,21 +851,14 @@ export default function CanvasEditor({ file }: { file: File }) {
                       <div className="absolute rounded-tl-full" style={{ bottom: cornerOffset, right: cornerOffset, width: cornerSize, height: cornerSize, borderTop: innerBorder, borderLeft: innerBorder, backgroundColor: canvasBgColor }}></div>
                     </div>
 
-                    {/* BRAND LOGO */}
                     {logoBase64 && (
                       <img src={logoBase64} alt="Brand Logo" className="absolute z-30 object-contain" style={{ top: 40*zoom, left: 40*zoom, width: 120*zoom }} />
                     )}
 
-                    {/* CUSTOM THEMED PDF IMAGE */}
                     <img 
                       src={item.imageBase64} 
                       alt={`Original Page`} 
-                      style={{ 
-                        width: '100%', 
-                        height: '100%', 
-                        objectFit: 'cover',
-                        mixBlendMode: 'multiply'
-                      }} 
+                      style={{ width: '100%', height: '100%', objectFit: 'cover', mixBlendMode: 'multiply' }} 
                     />
                   </>
                 )}
@@ -780,7 +867,6 @@ export default function CanvasEditor({ file }: { file: File }) {
           })()}
         </div>
       </div>
-      
     </div>
   );
 }
