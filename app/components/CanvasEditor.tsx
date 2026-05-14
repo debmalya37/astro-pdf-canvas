@@ -1,6 +1,7 @@
 "use client";
 import React, { useState, useEffect } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
+import { jsPDF } from 'jspdf'; // NEW: Client-side PDF generation
 
 // Force HTTPS, use Unpkg, and target the .mjs module for PDF.js v5+
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
@@ -49,6 +50,16 @@ const hexToRgb = (hex: string) => {
   return [(bigint >> 16) & 255, (bigint >> 8) & 255, bigint & 255];
 };
 
+// Helper to load base64 string into an HTMLImageElement for canvas drawing
+const loadImage = (src: string): Promise<HTMLImageElement> => {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+};
+
 // A tiny transparent pixel as a safe fallback default image
 const DEFAULT_PLACEHOLDER = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
@@ -91,7 +102,10 @@ export default function CanvasEditor({ file }: { file: File }) {
   const [canvasBgColor, setCanvasBgColor] = useState<string>('#fdf9f1'); // Cream
   const [logoBase64, setLogoBase64] = useState<string | null>(null);
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
+  
+  // Export tracking states
   const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
 
   // Zoom & Border Customization
   const [zoom, setZoom] = useState<number>(1);
@@ -159,7 +173,6 @@ export default function CanvasEditor({ file }: { file: File }) {
         canvas.width = viewport.width;
         canvas.height = viewport.height;
 
-        // FIX: Added 'canvas: canvas' parameter to satisfy strict PDF.js v5+ TypeScript requirements
         await page.render({ canvasContext: context, canvas: canvas, viewport }).promise;
 
         const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
@@ -170,6 +183,7 @@ export default function CanvasEditor({ file }: { file: File }) {
           
           if (r > 240 && g > 240 && b > 240) continue; 
 
+          // FIX: Initialize variables to satisfy strict TypeScript requirements
           let tr = 0, tg = 0, tb = 0; 
           let isTarget = false;
 
@@ -206,11 +220,19 @@ export default function CanvasEditor({ file }: { file: File }) {
   };
 
   useEffect(() => {
-    processPDF();
+    // Defer the heavy processing to the next event loop tick
+    // This allows React to paint the UI first and eliminates the cascading render warning.
+    const timer = setTimeout(() => {
+      processPDF();
+    }, 0);
+
+    // Cleanup function to prevent memory leaks if the component unmounts quickly
+    return () => clearTimeout(timer);
+    
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file]);
 
-  // --- PRESET SYSTEM HANDLERS (Now using IndexedDB) ---
+  // --- PRESET SYSTEM HANDLERS (Using IndexedDB) ---
   const handleSavePreset = async () => {
     const name = prompt("Enter a name for this preset (e.g., 'Premium Gold Theme'):");
     if (!name) return;
@@ -345,43 +367,6 @@ export default function CanvasEditor({ file }: { file: File }) {
     });
   };
 
-  // --- 3. EXPORT HANDLER ---
-  const handleExport = async () => {
-    setIsExporting(true);
-    try {
-      const response = await fetch('/api/export-pdf', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          frontCovers,          
-          backCover,            
-          originalPagesBase64: themedPagesBase64, 
-          canvasBgColor,
-          logoBase64,
-          insertedPages,
-          borderConfig 
-        }),
-      });
-
-      if (!response.ok) throw new Error('Export failed');
-
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `Branded_Report_${file.name.replace('.pdf', '')}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
-    } catch (error) {
-      console.error("Failed to export PDF:", error);
-      alert("Failed to export PDF.");
-    } finally {
-      setIsExporting(false);
-    }
-  };
-
   // --- 4. PREPARE RENDER ARRAY (Interleaving) ---
   const renderPages: any[] = [];
   
@@ -405,6 +390,112 @@ export default function CanvasEditor({ file }: { file: File }) {
   if (backCover.image) {
     renderPages.push({ type: 'back-cover', imageBase64: backCover.image, url: backCover.url, key: `back-cover`, label: `Back Cover (Link)` });
   }
+
+
+  // --- 3. EXPORT HANDLER (Client-Side jsPDF Engine) ---
+  // Completely bypasses Vercel's 4.5MB Payload limit by rendering directly in the browser!
+  const handleExport = async () => {
+    setIsExporting(true);
+    setExportProgress(0);
+
+    try {
+      const pdfWidth = 595;
+      const pdfHeight = 842;
+      const scale = 2; // High-res rendering for crisp charts
+
+      const pdf = new jsPDF({ orientation: 'p', unit: 'px', format: [pdfWidth, pdfHeight], hotfixes: ["px_scaling"] });
+
+      for (let i = 0; i < renderPages.length; i++) {
+        const item = renderPages[i];
+        
+        // 1. Create an offscreen canvas to paint the page
+        const canvas = document.createElement('canvas');
+        canvas.width = pdfWidth * scale;
+        canvas.height = pdfHeight * scale;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) continue;
+
+        // 2. Fill Background Color
+        ctx.fillStyle = canvasBgColor;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        if (item.type === 'original') {
+          // A. DRAW GOLDEN BORDERS natively in Canvas
+          const bSize = borderConfig.size * scale;
+          const offset = 16 * scale;
+          const cSize = 32 * scale;
+          
+          ctx.strokeStyle = borderConfig.color;
+          
+          // Outer Border
+          ctx.lineWidth = 1 * scale;
+          ctx.strokeRect(8 * scale, 8 * scale, canvas.width - 16 * scale, canvas.height - 16 * scale);
+          
+          // Inner Border & Corners Masking
+          ctx.lineWidth = bSize;
+          ctx.strokeRect(offset, offset, canvas.width - offset*2, canvas.height - offset*2);
+          
+          ctx.fillStyle = canvasBgColor;
+          // Top Left Corner
+          ctx.fillRect(offset - bSize, offset - bSize, cSize, cSize);
+          ctx.beginPath(); ctx.arc(offset - bSize, offset - bSize, cSize, 0, Math.PI/2); ctx.stroke();
+          // Top Right Corner
+          ctx.fillRect(canvas.width - offset + bSize - cSize, offset - bSize, cSize, cSize);
+          ctx.beginPath(); ctx.arc(canvas.width - offset + bSize, offset - bSize, cSize, Math.PI/2, Math.PI); ctx.stroke();
+          // Bottom Right Corner
+          ctx.fillRect(canvas.width - offset + bSize - cSize, canvas.height - offset + bSize - cSize, cSize, cSize);
+          ctx.beginPath(); ctx.arc(canvas.width - offset + bSize, canvas.height - offset + bSize, cSize, Math.PI, Math.PI*1.5); ctx.stroke();
+          // Bottom Left Corner
+          ctx.fillRect(offset - bSize, canvas.height - offset + bSize - cSize, cSize, cSize);
+          ctx.beginPath(); ctx.arc(offset - bSize, canvas.height - offset + bSize, cSize, Math.PI*1.5, Math.PI*2); ctx.stroke();
+
+          // B. DRAW LOGO
+          if (logoBase64) {
+            const logoImg = await loadImage(logoBase64);
+            const lWidth = 120 * scale;
+            const lHeight = lWidth * (logoImg.height / logoImg.width);
+            ctx.drawImage(logoImg, 40 * scale, 40 * scale, lWidth, lHeight);
+          }
+
+          // C. DRAW THEMED PDF PAGE (Using mix-blend-mode: multiply natively)
+          const pdfImg = await loadImage(item.imageBase64);
+          ctx.globalCompositeOperation = 'multiply';
+          ctx.drawImage(pdfImg, 0, 0, canvas.width, canvas.height);
+          ctx.globalCompositeOperation = 'source-over'; // Reset
+
+        } else {
+          // --- FULL BLEED PAGES (Inserted, Front Cover, Back Cover) ---
+          if (item.imageBase64 && item.imageBase64 !== DEFAULT_PLACEHOLDER) {
+            const img = await loadImage(item.imageBase64);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          }
+        }
+
+        // 3. Compress painted canvas to JPEG and add to PDF
+        const finalImgData = canvas.toDataURL('image/jpeg', 0.85);
+        if (i > 0) pdf.addPage();
+        pdf.addImage(finalImgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
+
+        // 4. Attach Hyperlink for Back Cover
+        if (item.type === 'back-cover' && item.url) {
+          pdf.link(0, 0, pdfWidth, pdfHeight, { url: item.url });
+        }
+
+        // Update Progress
+        setExportProgress(Math.round(((i + 1) / renderPages.length) * 100));
+        await new Promise(resolve => setTimeout(resolve, 0)); // Yield to UI thread
+      }
+
+      // 5. Trigger native browser download!
+      pdf.save(`Branded_Report_${file.name.replace('.pdf', '')}.pdf`);
+
+    } catch (error) {
+      console.error("Export Error:", error);
+      alert("Failed to export PDF locally.");
+    } finally {
+      setIsExporting(false);
+    }
+  };
 
   const activePageToRender = renderPages[currentPageIndex];
 
@@ -492,10 +583,10 @@ export default function CanvasEditor({ file }: { file: File }) {
               onClick={handleExport}
               disabled={isExporting || needsReprocessing}
               className={`px-6 py-2 text-sm font-bold rounded-md shadow-md transition-all ${
-                isExporting || needsReprocessing ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-lg'
+                isExporting || needsReprocessing ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700 hover:shadow-lg'
               }`}
             >
-              {isExporting ? 'Generating...' : 'Export as PDF'}
+              {isExporting ? `Compiling PDF (${exportProgress}%)...` : 'Export as PDF'}
             </button>
           </div>
         </div>
