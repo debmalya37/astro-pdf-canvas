@@ -170,7 +170,7 @@ export default function CanvasEditor({ file }: { file: File }) {
           
           if (r > 240 && g > 240 && b > 240) continue; 
 
-          let tr, tg, tb;
+          let tr = 0, tg = 0, tb = 0; 
           let isTarget = false;
 
           if (r > g + 40 && r > b + 40) { 
