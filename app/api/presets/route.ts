@@ -10,6 +10,7 @@ export async function GET() {
     const presets = await Preset.find({}).lean();
     return NextResponse.json(presets);
   } catch (error) {
+    console.error('MongoDB GET Error:', error); // <-- Prints exact error to Vercel Logs
     return NextResponse.json({ error: 'Failed to fetch presets' }, { status: 500 });
   }
 }
@@ -21,6 +22,7 @@ export async function POST(req: NextRequest) {
     const newPreset = await Preset.create(data);
     return NextResponse.json(newPreset);
   } catch (error) {
+    console.error('MongoDB POST Error:', error);
     return NextResponse.json({ error: 'Failed to create preset' }, { status: 500 });
   }
 }
@@ -32,6 +34,7 @@ export async function PUT(req: NextRequest) {
     const updatedPreset = await Preset.findOneAndUpdate({ id: data.id }, data, { new: true });
     return NextResponse.json(updatedPreset);
   } catch (error) {
+    console.error('MongoDB PUT Error:', error);
     return NextResponse.json({ error: 'Failed to update preset' }, { status: 500 });
   }
 }
@@ -43,6 +46,7 @@ export async function DELETE(req: NextRequest) {
     await Preset.deleteMany({ isGlobal: { $ne: true } }); 
     return NextResponse.json({ success: true });
   } catch (error) {
+    console.error('MongoDB DELETE Error:', error);
     return NextResponse.json({ error: 'Failed to clear presets' }, { status: 500 });
   }
 }
