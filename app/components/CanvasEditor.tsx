@@ -54,6 +54,8 @@ interface Preset {
   canvasBgColor: string;
   borderConfig: { color: string; size: number };
   logoBase64: string | null;
+  brightness: number; // NEW: Image processing controls
+  contrast: number;   // NEW: Image processing controls
 }
 
 // --- GLOBAL / REPOSITORY PRESETS ---
@@ -70,7 +72,9 @@ const GLOBAL_PRESETS: Preset[] = [
     themeColors: { black: '#4a3018', red: '#b48c36', green: '#2d3748' },
     canvasBgColor: '#fdf9f1',
     borderConfig: { color: '#b48c36', size: 3 },
-    logoBase64: null
+    logoBase64: null,
+    brightness: 102, // Default tweaked to fix PDF dullness
+    contrast: 108    // Default tweaked to make colors pop natively
   }
 ];
 
@@ -95,9 +99,11 @@ export default function CanvasEditor({ file }: { file: File }) {
   const [zoom, setZoom] = useState<number>(1);
   const [borderConfig, setBorderConfig] = useState({ color: '#b48c36', size: 3 });
 
-  // Advanced Text Color Mapping
+  // Advanced Text Color Mapping & Image Processing
   const defaultColors = { black: '#4a3018', red: '#b48c36', green: '#2d3748' };
   const [themeColors, setThemeColors] = useState(defaultColors);
+  const [brightness, setBrightness] = useState<number>(102); // NEW
+  const [contrast, setContrast] = useState<number>(108);     // NEW
   const [needsReprocessing, setNeedsReprocessing] = useState(false);
 
   // --- DYNAMIC PAGE BREAKER STATES ---
@@ -243,7 +249,7 @@ export default function CanvasEditor({ file }: { file: File }) {
         body: formData,
       });
       const data = await res.json();
-      return data.secure_url; // Return the secure Cloudinary URL
+      return data.secure_url; 
     } catch (err) {
       console.error("Cloudinary upload failed", err);
       alert("Failed to upload image to the cloud.");
@@ -255,13 +261,14 @@ export default function CanvasEditor({ file }: { file: File }) {
 
   // --- MONGODB PRESET SYSTEM HANDLERS ---
   const handleSaveAsNew = async () => {
-    const name = prompt("Enter a name for this new preset (e.g., 'Winter Campaign'):");
+    const name = prompt("Enter a name for this new preset:");
     if (!name) return;
 
     const newPreset: Preset = {
       id: Date.now().toString(),
       name,
-      frontCovers, backCover, insertPositions, insertedPages, themeColors, canvasBgColor, borderConfig, logoBase64
+      frontCovers, backCover, insertPositions, insertedPages, themeColors, 
+      canvasBgColor, borderConfig, logoBase64, brightness, contrast
     };
 
     setIsSavingPreset(true);
@@ -293,7 +300,8 @@ export default function CanvasEditor({ file }: { file: File }) {
 
     const updatedPreset: Preset = {
       ...presetToUpdate,
-      frontCovers, backCover, insertPositions, insertedPages, themeColors, canvasBgColor, borderConfig, logoBase64
+      frontCovers, backCover, insertPositions, insertedPages, themeColors, 
+      canvasBgColor, borderConfig, logoBase64, brightness, contrast
     };
 
     setIsSavingPreset(true);
@@ -327,6 +335,8 @@ export default function CanvasEditor({ file }: { file: File }) {
       setCanvasBgColor(p.canvasBgColor);
       setBorderConfig(p.borderConfig);
       setLogoBase64(p.logoBase64);
+      setBrightness(p.brightness ?? 100);
+      setContrast(p.contrast ?? 100);
       
       setHasUnsavedChanges(false);
       setNeedsReprocessing(true);
@@ -357,6 +367,8 @@ export default function CanvasEditor({ file }: { file: File }) {
       setCanvasBgColor(p.canvasBgColor);
       setBorderConfig(p.borderConfig);
       setLogoBase64(p.logoBase64);
+      setBrightness(p.brightness ?? 100);
+      setContrast(p.contrast ?? 100);
       
       setActivePresetId(presetId);
       setHasUnsavedChanges(false);
@@ -370,7 +382,6 @@ export default function CanvasEditor({ file }: { file: File }) {
         await fetch('/api/presets', { method: 'DELETE' });
         setPresets([...GLOBAL_PRESETS]);
         
-        // If the active preset was just deleted, reset to default
         if (activePresetId && !GLOBAL_PRESETS.find(p => p.id === activePresetId)) {
           setActivePresetId('global-default-gold');
           handleDiscard(); 
@@ -471,8 +482,7 @@ export default function CanvasEditor({ file }: { file: File }) {
     renderPages.push({ type: 'back-cover', imageBase64: backCover.image, url: backCover.url, key: `back-cover`, label: `Back Cover (Link)` });
   }
 
-
-  // --- 3. EXPORT HANDLER (Client-Side jsPDF Engine) ---
+  // --- CLIENT-SIDE EXPORT ENGINE ---
   const handleExport = async () => {
     setIsExporting(true);
     setExportProgress(0);
@@ -480,7 +490,7 @@ export default function CanvasEditor({ file }: { file: File }) {
     try {
       const pdfWidth = 595;
       const pdfHeight = 842;
-      const scale = 2; // High-res rendering for crisp charts
+      const scale = 2; // High-res rendering
 
       const pdf = new jsPDF({ orientation: 'p', unit: 'px', format: [pdfWidth, pdfHeight], hotfixes: ["px_scaling"] });
 
@@ -526,8 +536,15 @@ export default function CanvasEditor({ file }: { file: File }) {
           }
 
           const pdfImg = await loadImage(item.imageBase64);
+          
+          // Apply Multiply and Image Filters
           ctx.globalCompositeOperation = 'multiply';
+          ctx.filter = `brightness(${brightness}%) contrast(${contrast}%)`;
+          
           ctx.drawImage(pdfImg, 0, 0, canvas.width, canvas.height);
+          
+          // Reset context to default
+          ctx.filter = 'none';
           ctx.globalCompositeOperation = 'source-over'; 
 
         } else {
@@ -650,7 +667,6 @@ export default function CanvasEditor({ file }: { file: File }) {
 
         {/* ROW 1: Essential Controls */}
         <div className="flex flex-wrap items-center gap-4 justify-between w-full">
-          
           <div className="flex items-center gap-3 bg-slate-100 p-1.5 rounded-lg shadow-inner">
             <button onClick={() => setZoom(z => Math.max(0.5, z - 0.1))} className="w-7 h-7 bg-white rounded shadow-sm text-slate-600 font-bold hover:bg-slate-50">-</button>
             <span className="text-xs font-semibold w-10 text-center">{Math.round(zoom * 100)}%</span>
@@ -693,7 +709,7 @@ export default function CanvasEditor({ file }: { file: File }) {
           </div>
         </div>
 
-        {/* ROW 2: Advanced Color Controls & Interleaving */}
+        {/* ROW 2: Advanced Color Controls & Image Processing */}
         <div className="flex flex-wrap items-end gap-6 border-t border-slate-100 pt-3">
           
           <div className="flex items-center gap-3">
@@ -713,6 +729,20 @@ export default function CanvasEditor({ file }: { file: File }) {
               </div>
             </div>
             {needsReprocessing && <button onClick={processPDF} className="text-[10px] bg-indigo-600 text-white font-bold px-3 py-1.5 rounded shadow-sm hover:bg-indigo-700 animate-pulse">Apply Colors</button>}
+          </div>
+
+          <div className="flex items-center gap-4 border-l border-slate-200 pl-4">
+            <span className="text-[10px] font-bold tracking-wider text-slate-400 uppercase">Image Fix:</span>
+            <div className="flex items-center gap-4 bg-slate-50 p-1 px-3 rounded-lg border border-slate-200 shadow-inner">
+              <label className="text-[10px] text-slate-500 font-bold flex items-center gap-2 cursor-pointer" title="Brightness">
+                ☀️ {brightness}%
+                <input type="range" min="50" max="150" value={brightness} onChange={(e) => { setBrightness(Number(e.target.value)); markDirty(); }} className="w-16 h-1 accent-indigo-600" />
+              </label>
+              <label className="text-[10px] text-slate-500 font-bold flex items-center gap-2 cursor-pointer" title="Contrast">
+                ◐ {contrast}%
+                <input type="range" min="50" max="150" value={contrast} onChange={(e) => { setContrast(Number(e.target.value)); markDirty(); }} className="w-16 h-1 accent-indigo-600" />
+              </label>
+            </div>
           </div>
 
           <div className="flex items-center gap-3 border-l border-slate-200 pl-4 flex-1">
@@ -779,7 +809,15 @@ export default function CanvasEditor({ file }: { file: File }) {
             >
               <div className="bg-white rounded overflow-hidden aspect-[1/1.4] shadow-sm pointer-events-none relative flex items-center justify-center" style={{ backgroundColor: canvasBgColor }}>
                 {item.type === 'original' ? (
-                  <img src={item.imageBase64} alt={`Thumb ${idx}`} className="w-full h-full object-cover" style={{ mixBlendMode: 'multiply' }} />
+                  <img 
+                    src={item.imageBase64} 
+                    alt={`Thumb ${idx}`} 
+                    className="w-full h-full object-cover" 
+                    style={{ 
+                      mixBlendMode: 'multiply',
+                      filter: `brightness(${brightness}%) contrast(${contrast}%)` 
+                    }} 
+                  />
                 ) : item.imageBase64 === DEFAULT_PLACEHOLDER ? (
                   <span className="text-[8px] text-slate-400 font-bold uppercase tracking-widest text-center px-2">Awaiting<br/>Upload</span>
                 ) : (
@@ -834,11 +872,6 @@ export default function CanvasEditor({ file }: { file: File }) {
                     ) : (
                        <img src={item.imageBase64} alt="Custom Insert" className="w-full h-full object-cover" />
                     )}
-
-                    {/* Labels for Preview Canvas */}
-                    {item.type === 'front-cover' && <div className="absolute top-6 right-6 bg-indigo-500/90 backdrop-blur text-white text-xs px-3 py-1 rounded-full shadow-lg z-50">Front Cover</div>}
-                    {item.type === 'back-cover' && <div className="absolute top-6 right-6 bg-violet-500/90 backdrop-blur text-white text-xs px-3 py-1 rounded-full shadow-lg z-50">Back Cover (Link Attached)</div>}
-                    {item.type === 'inserted' && <div className="absolute top-6 right-6 bg-emerald-500/90 backdrop-blur text-white text-xs px-3 py-1 rounded-full shadow-lg z-50">Marketing Insert</div>}
                   </div>
                   
                 ) : (
@@ -858,7 +891,13 @@ export default function CanvasEditor({ file }: { file: File }) {
                     <img 
                       src={item.imageBase64} 
                       alt={`Original Page`} 
-                      style={{ width: '100%', height: '100%', objectFit: 'cover', mixBlendMode: 'multiply' }} 
+                      style={{ 
+                        width: '100%', 
+                        height: '100%', 
+                        objectFit: 'cover', 
+                        mixBlendMode: 'multiply',
+                        filter: `brightness(${brightness}%) contrast(${contrast}%)` 
+                      }} 
                     />
                   </>
                 )}

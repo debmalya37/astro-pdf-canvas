@@ -21,7 +21,11 @@ const PresetSchema = new mongoose.Schema({
     color: String,
     size: Number
   },
-  logoBase64: String // Reused for Cloudinary URL to prevent breaking existing state
+  logoBase64: String, // Reused for Cloudinary URL to prevent breaking existing state
+  
+  // NEW: Image processing controls
+  brightness: { type: Number, default: 100 }, 
+  contrast: { type: Number, default: 100 }    
 }, { timestamps: true });
 
 export default mongoose.models.Preset || mongoose.model('Preset', PresetSchema);
