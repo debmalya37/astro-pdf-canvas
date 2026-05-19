@@ -167,7 +167,8 @@ export default function CanvasEditor({ file }: { file: File }) {
 
       for (let i = 1; i <= totalPages; i++) {
         const page = await pdf.getPage(i);
-        const viewport = page.getViewport({ scale: 2.0 }); 
+        // BUMP TO 3.0 or 4.0 for Ultra-HD Retina Rendering
+        const viewport = page.getViewport({ scale: 3.0 });
         
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d', { willReadFrequently: true });
@@ -207,7 +208,7 @@ export default function CanvasEditor({ file }: { file: File }) {
         }
         
         context.putImageData(imageData, 0, 0);
-        pagesArray.push(canvas.toDataURL('image/jpeg', 0.85));
+        pagesArray.push(canvas.toDataURL('image/jpeg', 0.98));
         setProcessingProgress(Math.round((i / totalPages) * 100));
         await new Promise(resolve => setTimeout(resolve, 0));
       }
@@ -490,7 +491,7 @@ export default function CanvasEditor({ file }: { file: File }) {
     try {
       const pdfWidth = 595;
       const pdfHeight = 842;
-      const scale = 2; // High-res rendering
+      const scale = 3; // ultra High-res rendering
 
       const pdf = new jsPDF({ orientation: 'p', unit: 'px', format: [pdfWidth, pdfHeight], hotfixes: ["px_scaling"] });
 
@@ -554,7 +555,7 @@ export default function CanvasEditor({ file }: { file: File }) {
           }
         }
 
-        const finalImgData = canvas.toDataURL('image/jpeg', 0.85);
+        const finalImgData = canvas.toDataURL('image/jpeg', 0.98);
         if (i > 0) pdf.addPage();
         pdf.addImage(finalImgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
 
@@ -897,6 +898,7 @@ export default function CanvasEditor({ file }: { file: File }) {
                         objectFit: 'cover', 
                         mixBlendMode: 'multiply',
                         filter: `brightness(${brightness}%) contrast(${contrast}%)` 
+                        
                       }} 
                     />
                   </>
