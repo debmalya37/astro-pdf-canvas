@@ -26,7 +26,7 @@ export default function LoginPage() {
         {/* Branding */}
         <div className="flex flex-col items-center gap-4 mb-10">
           <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-indigo-600 to-violet-600 flex items-center justify-center text-white text-3xl font-bold shadow-xl shadow-indigo-200">
-            C
+            A
           </div>
           <div className="text-center">
             <h1 className="text-3xl font-extrabold text-slate-800 tracking-tight">
