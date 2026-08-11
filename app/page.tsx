@@ -14,7 +14,7 @@ export default function Home() {
               C
             </div>
             <span className="text-xl font-extrabold text-slate-800 tracking-tight">
-              Cosmic<span className="text-indigo-600 font-medium">Studio</span>
+              Astro<span className="text-indigo-600 font-medium">PDF Engine</span>
             </span>
           </div>
           

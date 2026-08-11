@@ -37,7 +37,7 @@ export default function PdfUploader() {
           {/* Header Area */}
           <div className="text-center mb-10">
             <h1 className="text-4xl font-extrabold text-slate-800 tracking-tight mb-3">
-              Cosmic <span className="text-indigo-600">PDF Engine</span>
+              Astro <span className="text-indigo-600">PDF Engine</span>
             </h1>
             <p className="text-slate-500 font-medium text-lg">
               Upload the raw astrology report to apply global branding, charts, and marketing pages.
