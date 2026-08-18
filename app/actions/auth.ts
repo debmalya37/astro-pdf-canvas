@@ -7,7 +7,7 @@ export async function login(prevState: any, formData: FormData) {
   const id = formData.get('id')
   const password = formData.get('password')
 
-  if (id === 'astropdf' && password === 'admin@26') {
+  if (id === 'astropdf' && password === 'admin@24') {
     // In Next.js 15/16, cookies() is asynchronous
     const cookieStore = await cookies()
     cookieStore.set('auth_token', 'authenticated', {
